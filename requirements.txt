@@ -1,0 +1,6 @@
+streamlit==1.38.0
+pydantic==2.9.2
+transformers==4.44.2
+torch==2.4.1
+networkx==3.3
+pytest==8.3.3
