@@ -1,6 +1,19 @@
+# Core dependencies
 streamlit==1.38.0
 pydantic==2.9.2
 transformers==4.44.2
 torch==2.4.1
 networkx==3.3
 pytest==8.3.3
+
+# Metrics, logging, and observability
+python-json-logger==2.0.7
+
+# Data processing (for batch mode)
+pandas==2.2.1
+
+# Development/testing extras
+pytest-cov==4.1.0
+pytest-xdist==3.5.0  # parallel test execution
+black==23.12.1       # code formatting
+mypy==1.7.1          # type checking
