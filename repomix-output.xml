@@ -4472,281 +4472,6 @@ def run_triage(
         ) from exc
 </file>
 
-<file path="engine/orchestrator.py">
-"""
-engine/orchestrator.py
-
-Owner: Satya — Day 2
-
-The single entry point the UI calls. Everything about *which* pipeline a
-patient goes through, and how errors are handled, lives here — the UI
-layer should never call nlp_classifier / risk_engine / vitals_age /
-mass_casualty directly.
-"""
-
-from __future__ import annotations
-
-from dataclasses import dataclass
-
-from engine.mass_casualty import triage_single_mass_casualty
-from engine.nlp_classifier import classify_chief_complaint
-from engine.risk_engine import DEFAULT_ALPHA, DEFAULT_BETA, DEFAULT_GAMMA, check_decide_triggers, compute_risk, map_risk_to_esi
-from engine.vitals_age import score_age_factor, score_vital_deviation
-from models.schemas import PatientInput, TriageResult
-
-
-class TriageError(Exception):
-    """Raised when the pipeline cannot produce a result at all."""
-
-
-# If any decide-trigger fires, the recommended ESI level is never allowed to
-# be weaker (numerically higher) than this. 2 = "Emergent" — see the ESI
-# scale in risk_engine.py.
-DECIDE_TRIGGER_ESI_CEILING = 2
-
-
-@dataclass
-class TriageRunMeta:
-    """Extra, UI-relevant metadata about how a result was produced."""
-
-    used_nlp_fallback: bool = False
-
-
-def run_triage(
-    patient: PatientInput,
-    alpha: float = DEFAULT_ALPHA,
-    beta: float = DEFAULT_BETA,
-    gamma: float = DEFAULT_GAMMA,
-) -> tuple[TriageResult, TriageRunMeta]:
-    """
-    Route a PatientInput to the correct pipeline and return a TriageResult.
-
-    - mass_casualty_mode=True  -> deterministic, vitals-only bypass queue.
-    - mass_casualty_mode=False -> full MMTG pipeline (NLP + vitals + age).
-
-    Raises:
-        TriageError if neither pipeline can produce a result (e.g. a
-        completely unexpected internal failure). Both individual pipelines
-        already degrade gracefully on their own (see nlp_classifier.py's
-        fallback), so this should be rare — it exists as a last line of
-        defense so the UI never sees a raw traceback.
-    """
-    try:
-        if patient.mass_casualty_mode:
-            result = triage_single_mass_casualty(patient)
-            return result, TriageRunMeta(used_nlp_fallback=False)
-
-        nlp_label, nlp_confidence, used_fallback = classify_chief_complaint(
-            patient.chief_complaint
-        )
-        from engine.nlp_classifier import LABEL_URGENCY_WEIGHT
-
-        nlp_urgency = round(nlp_confidence * LABEL_URGENCY_WEIGHT[nlp_label], 4)
-
-        vital_dev = score_vital_deviation(
-            patient.age, patient.heart_rate, patient.spo2, patient.temperature
-        )
-        age_factor = score_age_factor(patient.age)
-
-        risk_score, breakdown = compute_risk(
-            vital_dev, nlp_urgency, age_factor, alpha=alpha, beta=beta, gamma=gamma
-        )
-        esi_level = map_risk_to_esi(risk_score)
-        decisions = check_decide_triggers(vital_dev, nlp_urgency, nlp_label, patient.heart_rate)
-
-        # Coherence invariant: if the system is confident enough to auto-trigger
-        # a protocol action (e.g. auto-order an ECG), it can never simultaneously
-        # recommend an ESI level weaker than "Emergent". A decide-trigger and a
-        # low-urgency recommendation contradicting each other is exactly the kind
-        # of inconsistency that erodes clinician trust — so we enforce it as an
-        # explicit floor here rather than relying on threshold tuning alone.
-        if decisions and esi_level > DECIDE_TRIGGER_ESI_CEILING:
-            esi_level = DECIDE_TRIGGER_ESI_CEILING
-
-        result = TriageResult(
-            risk_score=risk_score,
-            esi_level=esi_level,
-            decisions=decisions,
-            mass_casualty_mode=False,
-            explain=breakdown,
-            reason=None,
-        )
-        return result, TriageRunMeta(used_nlp_fallback=used_fallback)
-
-    except Exception as exc:  # last line of defense — UI must never see a raw traceback
-        raise TriageError(f"Triage pipeline failed to produce a result: {exc}") from exc
-</file>
-
-<file path="engine/risk_engine.py">
-"""
-engine/risk_engine.py
-
-Owner: Qudsia — Day 2
-
-Baseline implementation is complete and tested. The DAG is modeled as an
-explicit class (RiskDAG) rather than a bare formula, so its node structure
-is inspectable — a judge can print `RiskDAG().describe()` and see exactly
-how a score was built, which is the whole point of choosing a graph over a
-black-box model.
-
-Qudsia: the weights, ESI thresholds, and decide-trigger rules below are all
-tunable in one place (top of file) — refine them against real/synthetic
-data without needing to touch the rest of the pipeline.
-"""
-
-from __future__ import annotations
-
-from dataclasses import dataclass
-
-from models.schemas import ExplainabilityBreakdown
-
-# --------------------------------------------------------------------------- #
-# Tunable parameters — the whole point of a transparent formula is that these
-# live in one place and are easy to defend/adjust.
-# --------------------------------------------------------------------------- #
-
-DEFAULT_ALPHA = 0.4   # weight on vital deviation
-DEFAULT_BETA = 0.4    # weight on NLP urgency
-DEFAULT_GAMMA = 0.2   # weight on age factor
-
-# ESI thresholds: risk_score >= threshold -> that ESI level.
-# Checked from most urgent (1) to least urgent (5); first match wins.
-ESI_THRESHOLDS = [
-    (0.80, 1),
-    (0.60, 2),
-    (0.40, 3),
-    (0.20, 4),
-    (0.00, 5),
-]
-
-
-# --------------------------------------------------------------------------- #
-# The DAG
-# --------------------------------------------------------------------------- #
-
-@dataclass
-class RiskNode:
-    name: str
-    value: float
-    weight: float | None = None
-
-    @property
-    def contribution(self) -> float:
-        return self.value if self.weight is None else self.value * self.weight
-
-
-class RiskDAG:
-    """
-    A small, explicit directed acyclic graph:
-
-        Vital_Deviation ---\\
-        NLP_Urgency -------- Risk_Score
-        Age_Factor  --------/
-
-    Each input node feeds one edge, weighted by alpha/beta/gamma, into a
-    single Risk_Score output node. Modeling it this way (rather than a bare
-    expression) means `describe()` can render the exact structure a judge
-    would want to see in an explainability audit.
-    """
-
-    def __init__(self, alpha: float = DEFAULT_ALPHA, beta: float = DEFAULT_BETA,
-                 gamma: float = DEFAULT_GAMMA):
-        self.alpha = alpha
-        self.beta = beta
-        self.gamma = gamma
-
-    def score(
-        self, vital_deviation: float, nlp_urgency: float, age_factor: float
-    ) -> tuple[float, ExplainabilityBreakdown]:
-        nodes = [
-            RiskNode("Vital_Deviation", vital_deviation, self.alpha),
-            RiskNode("NLP_Urgency", nlp_urgency, self.beta),
-            RiskNode("Age_Factor", age_factor, self.gamma),
-        ]
-        risk_score = round(min(1.0, sum(n.contribution for n in nodes)), 4)
-
-        breakdown = ExplainabilityBreakdown(
-            vital_deviation=vital_deviation,
-            nlp_urgency=nlp_urgency,
-            age_factor=age_factor,
-            alpha=self.alpha,
-            beta=self.beta,
-            gamma=self.gamma,
-            alpha_contribution=round(nodes[0].contribution, 4),
-            beta_contribution=round(nodes[1].contribution, 4),
-            gamma_contribution=round(nodes[2].contribution, 4),
-        )
-        return risk_score, breakdown
-
-    def describe(self) -> str:
-        return (
-            f"RiskDAG(alpha={self.alpha}, beta={self.beta}, gamma={self.gamma}) "
-            f"-> Risk_Score = alpha*Vital_Deviation + beta*NLP_Urgency + gamma*Age_Factor"
-        )
-
-
-# --------------------------------------------------------------------------- #
-# Public functions (the contract the orchestrator/UI call against)
-# --------------------------------------------------------------------------- #
-
-def compute_risk(
-    vital_deviation: float,
-    nlp_urgency: float,
-    age_factor: float,
-    alpha: float = DEFAULT_ALPHA,
-    beta: float = DEFAULT_BETA,
-    gamma: float = DEFAULT_GAMMA,
-) -> tuple[float, ExplainabilityBreakdown]:
-    """
-    Combine the three sub-scores into a final risk score via the RiskDAG.
-
-    Returns:
-        (risk_score, explainability_breakdown)
-    """
-    dag = RiskDAG(alpha=alpha, beta=beta, gamma=gamma)
-    return dag.score(vital_deviation, nlp_urgency, age_factor)
-
-
-def map_risk_to_esi(risk_score: float) -> int:
-    """
-    Map a continuous risk score in [0.0, 1.0] to a discrete ESI level (1-5).
-
-    1 = most urgent, 5 = least urgent. Thresholds are defined in
-    ESI_THRESHOLDS above — adjust them there, not here.
-    """
-    for threshold, esi in ESI_THRESHOLDS:
-        if risk_score >= threshold:
-            return esi
-    return 5  # fallback, should be unreachable given the 0.00 threshold
-
-
-def check_decide_triggers(
-    vital_deviation: float,
-    nlp_urgency: float,
-    nlp_label: str,
-    heart_rate: int,
-) -> list[str]:
-    """
-    Return narrow, high-confidence auto-triggered actions.
-
-    Deliberately conservative — this is the "decide" side of
-    decide-vs-recommend, so false positives are costly. Most patients
-    return an empty list.
-    """
-    decisions: list[str] = []
-
-    if nlp_label == "Cardiac" and nlp_urgency >= 0.80 and heart_rate > 120:
-        decisions.append("DECISION: Auto-order ECG + Cardiac Enzyme Panel")
-
-    if nlp_label == "Respiratory" and nlp_urgency >= 0.80 and vital_deviation >= 0.5:
-        decisions.append("DECISION: Auto-order pulse oximetry re-check + oxygen prep")
-
-    if nlp_label == "Trauma" and vital_deviation >= 0.7:
-        decisions.append("DECISION: Flag for immediate trauma-bay routing")
-
-    return decisions
-</file>
-
 <file path="engine/vitals_age.py">
 """
 engine/vitals_age.py
@@ -8502,32 +8227,6 @@ with right:
     st.markdown("</div>", unsafe_allow_html=True)
 </file>
 
-<file path=".env.example">
-# Database
-DATABASE_URL=postgresql://user:password@localhost:5432/patienttriage
-SQLALCHEMY_DATABASE_URL=postgresql://user:password@localhost:5432/patienttriage
-
-# API Settings
-API_HOST=0.0.0.0
-API_PORT=8000
-DEBUG=True
-ENVIRONMENT=development
-
-# CORS
-CORS_ORIGINS=["http://localhost:3000","http://localhost:8501"]
-
-# Authentication
-API_KEY_HEADER=X-API-Key
-SECRET_KEY=your-secret-key-here
-
-# NLP Settings
-NLP_MODEL=facebook/bart-large-mnli
-NLP_DEVICE=cpu
-
-# Logging
-LOG_LEVEL=INFO
-</file>
-
 <file path="INTEGRATION_GUIDE.md">
 # PatientTriage.ai Round 2 - File Integration Guide
 
@@ -8780,237 +8479,705 @@ python -c "from transformers import pipeline; pipeline('zero-shot-classification
 5. Use the API for integration with external systems
 </file>
 
-<file path="triage_metrics.jsonl">
-{"timestamp": "2026-08-29T01:52:47.269476", "patient_age": 0, "patient_spo2": 88.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.7725, "esi_level": 2, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.7290840148925781, "nlp_label": "Respiratory", "nlp_confidence": 0.6625}
-{"timestamp": "2026-08-29T01:52:47.281183", "patient_age": 88, "patient_spo2": 96.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.216, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.19407272338867188, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:52:47.281927", "patient_age": 35, "patient_spo2": 98.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.3063, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.19621849060058594, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:52:47.284995", "patient_age": 45, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.032, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.1575946807861328, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:52:47.285649", "patient_age": 50, "patient_spo2": 99.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.2476, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.14352798461914062, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:52:47.287471", "patient_age": 30, "patient_spo2": 95.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.032, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.3802776336669922, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:52:47.287698", "patient_age": 31, "patient_spo2": 96.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.1052, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.13518333435058594, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:52:47.288359", "patient_age": 32, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.1966, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.1862049102783203, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:52:47.288574", "patient_age": 33, "patient_spo2": 98.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.032, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.12135505676269531, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:52:47.288752", "patient_age": 34, "patient_spo2": 99.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.1052, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.11897087097167969, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:52:47.289342", "patient_age": 35, "patient_spo2": 95.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.1966, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.21314620971679688, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:52:47.289581", "patient_age": 36, "patient_spo2": 96.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.032, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.1277923583984375, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:52:47.289863", "patient_age": 37, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.1052, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.12278556823730469, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:52:47.290018", "patient_age": 38, "patient_spo2": 98.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.1966, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.10776519775390625, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:52:47.290188", "patient_age": 39, "patient_spo2": 99.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.032, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.11134147644042969, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:52:47.291213", "patient_age": 60, "patient_spo2": 92.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.3718, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.1609325408935547, "nlp_label": "Cardiac", "nlp_confidence": 0.575}
-{"timestamp": "2026-08-29T01:52:47.291441", "patient_age": 60, "patient_spo2": 92.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.4734, "esi_level": 3, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.1633167266845703, "nlp_label": "Cardiac", "nlp_confidence": 0.575}
-{"timestamp": "2026-08-29T01:52:47.292022", "patient_age": 45, "patient_spo2": 96.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.065, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.13399124145507812, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:52:47.292598", "patient_age": 60, "patient_spo2": 88.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.3219, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.1316070556640625, "nlp_label": "Cardiac", "nlp_confidence": 0.575}
-{"timestamp": "2026-08-29T01:52:47.296378", "patient_age": 0, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.212, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.1697540283203125, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:52:47.296600", "patient_age": 1, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.152, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.1266002655029297, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:52:47.296752", "patient_age": 50, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.032, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.10967254638671875, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:52:47.296928", "patient_age": 100, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.212, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.13971328735351562, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:52:47.297109", "patient_age": 120, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.212, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.13566017150878906, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:52:58.757248", "patient_age": 0, "patient_spo2": 88.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.7725, "esi_level": 2, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.5831718444824219, "nlp_label": "Respiratory", "nlp_confidence": 0.6625}
-{"timestamp": "2026-08-29T01:52:58.758129", "patient_age": 88, "patient_spo2": 96.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.216, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.1671314239501953, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:52:58.758835", "patient_age": 35, "patient_spo2": 98.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.3063, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.1857280731201172, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:52:58.759475", "patient_age": 45, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.032, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.17023086547851562, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:52:58.760066", "patient_age": 50, "patient_spo2": 99.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.2476, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.15687942504882812, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:52:58.761402", "patient_age": 30, "patient_spo2": 95.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.032, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.23937225341796875, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:52:58.761616", "patient_age": 31, "patient_spo2": 96.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.1052, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.1347064971923828, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:52:58.762321", "patient_age": 32, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.1966, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.46181678771972656, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:52:58.762541", "patient_age": 35, "patient_spo2": 95.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.1966, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.5521774291992188, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:52:58.762858", "patient_age": 34, "patient_spo2": 99.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.1052, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.8749961853027344, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:52:58.763013", "patient_age": 38, "patient_spo2": 98.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.1966, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.10895729064941406, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:52:58.763156", "patient_age": 39, "patient_spo2": 99.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.032, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.10251998901367188, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:52:58.762244", "patient_age": 33, "patient_spo2": 98.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.032, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.26679039001464844, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:52:58.762744", "patient_age": 37, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.1052, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.15354156494140625, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:52:58.763420", "patient_age": 36, "patient_spo2": 96.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.032, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 1.0068416595458984, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:52:58.764315", "patient_age": 60, "patient_spo2": 92.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.3718, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.1671314239501953, "nlp_label": "Cardiac", "nlp_confidence": 0.575}
-{"timestamp": "2026-08-29T01:52:58.764537", "patient_age": 60, "patient_spo2": 92.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.4734, "esi_level": 3, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.15878677368164062, "nlp_label": "Cardiac", "nlp_confidence": 0.575}
-{"timestamp": "2026-08-29T01:52:58.765116", "patient_age": 45, "patient_spo2": 96.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.065, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.12755393981933594, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:52:58.765730", "patient_age": 60, "patient_spo2": 88.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.3219, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.141143798828125, "nlp_label": "Cardiac", "nlp_confidence": 0.575}
-{"timestamp": "2026-08-29T01:52:58.776220", "patient_age": 0, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.212, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.17571449279785156, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:52:58.776460", "patient_age": 1, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.152, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.1659393310546875, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:52:58.776628", "patient_age": 50, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.032, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.12040138244628906, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:52:58.776780", "patient_age": 100, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.212, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.11467933654785156, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:52:58.776922", "patient_age": 120, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.212, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.10800361633300781, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:53:02.745851", "patient_age": 0, "patient_spo2": 88.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.7725, "esi_level": 2, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.5676746368408203, "nlp_label": "Respiratory", "nlp_confidence": 0.6625}
-{"timestamp": "2026-08-29T01:53:02.746752", "patient_age": 88, "patient_spo2": 96.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.216, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.19478797912597656, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:53:02.747430", "patient_age": 35, "patient_spo2": 98.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.3063, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.17213821411132812, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:53:02.748016", "patient_age": 45, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.032, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.13947486877441406, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:53:02.748651", "patient_age": 50, "patient_spo2": 99.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.2476, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.1461505889892578, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:53:02.749840", "patient_age": 30, "patient_spo2": 95.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.032, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.22912025451660156, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:53:02.750043", "patient_age": 31, "patient_spo2": 96.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.1052, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.1285076141357422, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:53:02.750608", "patient_age": 32, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.1966, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.3077983856201172, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:53:02.751161", "patient_age": 33, "patient_spo2": 98.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.032, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.43487548828125, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:53:02.751333", "patient_age": 35, "patient_spo2": 95.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.1966, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.4668235778808594, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:53:02.751508", "patient_age": 38, "patient_spo2": 98.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.1966, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.13184547424316406, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:53:02.751650", "patient_age": 39, "patient_spo2": 99.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.032, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.10347366333007812, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:53:02.751786", "patient_age": 36, "patient_spo2": 96.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.032, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.9007453918457031, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:53:02.751075", "patient_age": 34, "patient_spo2": 99.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.1052, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.2727508544921875, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:53:02.751972", "patient_age": 37, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.1052, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.7548332214355469, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:53:02.752905", "patient_age": 60, "patient_spo2": 92.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.3718, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.15473365783691406, "nlp_label": "Cardiac", "nlp_confidence": 0.575}
-{"timestamp": "2026-08-29T01:53:02.753081", "patient_age": 60, "patient_spo2": 92.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.4734, "esi_level": 3, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.11992454528808594, "nlp_label": "Cardiac", "nlp_confidence": 0.575}
-{"timestamp": "2026-08-29T01:53:02.753713", "patient_age": 45, "patient_spo2": 96.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.065, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.1304149627685547, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:53:02.754277", "patient_age": 60, "patient_spo2": 88.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.3219, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.14543533325195312, "nlp_label": "Cardiac", "nlp_confidence": 0.575}
-{"timestamp": "2026-08-29T01:53:02.755033", "patient_age": 45, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.032, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.24175643920898438, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:53:02.755614", "patient_age": 0, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.212, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.1304149627685547, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:53:02.755785", "patient_age": 1, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.152, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.11420249938964844, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:53:02.755942", "patient_age": 50, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.032, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.1163482666015625, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:53:02.756087", "patient_age": 100, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.212, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.10776519775390625, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:53:02.756233", "patient_age": 120, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.212, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.11324882507324219, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:53:05.438086", "patient_age": 0, "patient_spo2": 88.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.7725, "esi_level": 2, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.18215179443359375, "nlp_label": "Respiratory", "nlp_confidence": 0.6625}
-{"timestamp": "2026-08-29T01:53:05.439065", "patient_age": 88, "patient_spo2": 96.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.216, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.19407272338867188, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:53:05.439838", "patient_age": 35, "patient_spo2": 98.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.3063, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.17952919006347656, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:53:05.440622", "patient_age": 45, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.032, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.17523765563964844, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:53:05.441320", "patient_age": 50, "patient_spo2": 99.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.2476, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.1747608184814453, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:53:05.442818", "patient_age": 30, "patient_spo2": 95.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.032, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.3237724304199219, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:53:05.443069", "patient_age": 31, "patient_spo2": 96.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.1052, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.1609325408935547, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:53:05.443691", "patient_age": 32, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.1966, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.43201446533203125, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:53:05.443936", "patient_age": 33, "patient_spo2": 98.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.032, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.1659393310546875, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:53:05.444133", "patient_age": 34, "patient_spo2": 99.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.1052, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.14472007751464844, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:53:05.444325", "patient_age": 35, "patient_spo2": 95.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.1966, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.14710426330566406, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:53:05.444674", "patient_age": 36, "patient_spo2": 96.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.032, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.15401840209960938, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:53:05.444862", "patient_age": 37, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.1052, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.1285076141357422, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:53:05.445030", "patient_age": 38, "patient_spo2": 98.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.1966, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.12469291687011719, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:53:05.445191", "patient_age": 39, "patient_spo2": 99.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.032, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.1201629638671875, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:53:05.446233", "patient_age": 60, "patient_spo2": 92.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.3718, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.1742839813232422, "nlp_label": "Cardiac", "nlp_confidence": 0.575}
-{"timestamp": "2026-08-29T01:53:05.446485", "patient_age": 60, "patient_spo2": 92.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.4734, "esi_level": 3, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.17404556274414062, "nlp_label": "Cardiac", "nlp_confidence": 0.575}
-{"timestamp": "2026-08-29T01:53:05.447214", "patient_age": 45, "patient_spo2": 96.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.065, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.15115737915039062, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:53:05.447959", "patient_age": 60, "patient_spo2": 88.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.3219, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.17833709716796875, "nlp_label": "Cardiac", "nlp_confidence": 0.575}
-{"timestamp": "2026-08-29T01:53:05.448771", "patient_age": 45, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.032, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.2789497375488281, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:53:05.449444", "patient_age": 0, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.212, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.19168853759765625, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:53:05.449654", "patient_age": 1, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.152, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.14734268188476562, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:53:05.449828", "patient_age": 50, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.032, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.12803077697753906, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:53:05.449992", "patient_age": 100, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.212, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.12469291687011719, "nlp_label": "Routine", "nlp_confidence": 0.6}
-{"timestamp": "2026-08-29T01:53:05.450146", "patient_age": 120, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.212, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.11777877807617188, "nlp_label": "Routine", "nlp_confidence": 0.6}
-</file>
-
-<file path="engine/nlp_classifier.py">
+<file path="engine/orchestrator.py">
 """
-engine/nlp_classifier.py — Production Implementation
+engine/orchestrator.py
 
-Zero-shot NLP urgency classifier with keyword fallback.
-- Loads facebook/bart-large-mnli once and caches it (lru_cache + @st.cache_resource in UI).
-- Falls back to keyword heuristics if model load fails (e.g. offline environment).
-- Returns label, confidence, and fallback indicator so UI can warn users.
-- Urgency weights tuned so cardinal symptoms (cardiac: "crushing", respiratory:
-  "choking") move the needle more than symptom mentions alone.
+Production-grade single entry point for PatientTriage.ai.
+
+Features:
+- Normal triage: NLP + vitals + age
+- Mass casualty mode: deterministic vitals-only routing
+- NLP fallback / graceful degradation
+- Explainable risk scoring
+- Decision-recommendation coherence
+- Latency tracking
+- Metrics collection
 """
 
 from __future__ import annotations
 
-import re
-from functools import lru_cache
+import time
+from dataclasses import dataclass, field
 
-LABELS = ["Cardiac", "Respiratory", "Trauma", "Routine"]
-
-# Per-label urgency weight — turns (label, confidence) into a single urgency score.
-# Routine pulls down; Cardiac/Respiratory/Trauma push up.
-LABEL_URGENCY_WEIGHT = {
-    "Cardiac": 1.0,
-    "Respiratory": 0.9,
-    "Trauma": 0.95,
-    "Routine": 0.05,
-}
-
-# Weighted keyword fallback — strong phrases move the needle more.
-# "crushing" (cardiac) > "chest" (cardiac mention).
-# "choking" (respiratory emergency) > "cough" (respiratory mention).
-_FALLBACK_KEYWORDS = {
-    "Cardiac": {
-        "chest": 0.30, "heart": 0.30, "palpitation": 0.40, "tight": 0.35,
-        "pressure": 0.35, "crushing": 0.50, "radiating": 0.45, "left arm": 0.40,
-        "shortness of breath": 0.40, "syncope": 0.45,
-    },
-    "Respiratory": {
-        "breath": 0.35, "breathing": 0.30, "wheeze": 0.40, "cough": 0.25,
-        "choking": 0.50, "oxygen": 0.30, "shortness": 0.45, "gasping": 0.45,
-        "stridor": 0.50, "throat": 0.20,
-    },
-    "Trauma": {
-        "bleeding": 0.40, "fracture": 0.45, "fell": 0.30, "accident": 0.30,
-        "wound": 0.35, "broken": 0.40, "crash": 0.40, "laceration": 0.40,
-        "stab": 0.55, "crush": 0.50,
-    },
-}
+from engine.mass_casualty import triage_single_mass_casualty
+from engine.metrics import record_triage_run
+from engine.nlp_classifier import classify_chief_complaint
+from engine.risk_engine import (
+    DEFAULT_ALPHA,
+    DEFAULT_BETA,
+    DEFAULT_GAMMA,
+    check_decide_triggers,
+    compute_risk,
+    map_risk_to_esi,
+)
+from engine.vitals_age import score_age_factor, score_vital_deviation
+from models.schemas import PatientInput, TriageResult
 
 
-@lru_cache(maxsize=1)
-def _get_pipeline():
-    """Lazily load the zero-shot classification pipeline (cached via lru_cache)."""
-    from transformers import pipeline
-    return pipeline("zero-shot-classification", model="facebook/bart-large-mnli")
+# ---------------------------------------------------------------------------
+# Decision / recommendation coherence
+# ---------------------------------------------------------------------------
+
+# If an automatic clinical decision trigger fires, the recommendation
+# cannot be weaker than ESI 2 (Emergent).
+DECIDE_TRIGGER_ESI_CEILING = 2
 
 
-def _classify_with_model(chief_complaint: str) -> tuple[str, float]:
-    """Call the real zero-shot model."""
-    clf = _get_pipeline()
-    result = clf(chief_complaint, candidate_labels=LABELS)
-    return result["labels"][0], float(result["scores"][0])
+# ---------------------------------------------------------------------------
+# NLP timeout configuration
+# ---------------------------------------------------------------------------
+
+NLP_TIMEOUT_SECONDS = 5.0
 
 
-def _classify_with_fallback(chief_complaint: str) -> tuple[str, float]:
-    """Keyword-based fallback used if the transformer model can't load."""
-    text = chief_complaint.lower()
-    scores = {}
+# ---------------------------------------------------------------------------
+# Errors
+# ---------------------------------------------------------------------------
 
-    for label, keywords in _FALLBACK_KEYWORDS.items():
-        weight_sum = 0.0
-        for kw, weight in keywords.items():
-            if re.search(rf"\b{re.escape(kw)}", text):
-                weight_sum += weight
-        scores[label] = weight_sum
-
-    best_label = max(scores, key=scores.get)
-    if scores[best_label] == 0:
-        return "Routine", 0.6
-
-    confidence = min(0.95, 0.5 + (scores[best_label] * 0.25))
-    return best_label, confidence
+class TriageError(Exception):
+    """Raised when the triage pipeline cannot produce a result."""
+    pass
 
 
-def classify_chief_complaint(chief_complaint: str) -> tuple[str, float, bool]:
+# ---------------------------------------------------------------------------
+# Run metadata
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TriageRunMeta:
     """
-    Classify a chief complaint into one of four urgency categories.
+    Metadata about how the triage result was produced.
+
+    This is consumed by the Streamlit UI for:
+    - NLP fallback status
+    - NLP label
+    - NLP confidence
+    - latency
+    - recovery information
+    """
+
+    used_nlp_fallback: bool = False
+    nlp_confidence: float | None = None
+    nlp_label: str | None = None
+    latency_ms: float = 0.0
+    error_recovery_steps: list[str] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+class TriageConfig:
+    """Tunable configuration for the triage engine."""
+
+    def __init__(
+        self,
+        alpha: float = DEFAULT_ALPHA,
+        beta: float = DEFAULT_BETA,
+        gamma: float = DEFAULT_GAMMA,
+        enable_metrics: bool = True,
+        enable_decision_coherence_check: bool = True,
+    ):
+        self.alpha = alpha
+        self.beta = beta
+        self.gamma = gamma
+        self.enable_metrics = enable_metrics
+        self.enable_decision_coherence_check = (
+            enable_decision_coherence_check
+        )
+
+    def validate(self) -> None:
+        """Validate configuration values."""
+
+        if not (0.0 <= self.alpha <= 1.0):
+            raise ValueError(
+                f"alpha must be in [0.0, 1.0], got {self.alpha}"
+            )
+
+        if not (0.0 <= self.beta <= 1.0):
+            raise ValueError(
+                f"beta must be in [0.0, 1.0], got {self.beta}"
+            )
+
+        if not (0.0 <= self.gamma <= 1.0):
+            raise ValueError(
+                f"gamma must be in [0.0, 1.0], got {self.gamma}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Main triage pipeline
+# ---------------------------------------------------------------------------
+
+def run_triage(
+    patient: PatientInput,
+    config: TriageConfig | None = None,
+) -> tuple[TriageResult, TriageRunMeta]:
+    """
+    Run the appropriate triage pipeline.
+
+    Normal mode:
+        NLP + vitals + age + explainable risk scoring.
+
+    Mass casualty mode:
+        Deterministic vitals-only routing with NLP bypassed.
 
     Returns:
-        (label, confidence, used_fallback)
+        (TriageResult, TriageRunMeta)
+
+    Raises:
+        TriageError:
+            If the complete triage pipeline fails.
     """
+
+    # Use defaults when no custom configuration is supplied.
+    if config is None:
+        config = TriageConfig()
+
+    config.validate()
+
+    # Start latency measurement BEFORE any pipeline work.
+    start_time = time.time()
+
+    # Metadata object returned to the UI.
+    meta = TriageRunMeta()
+
     try:
-        label, confidence = _classify_with_model(chief_complaint)
-        return label, confidence, False
-    except Exception:
-        label, confidence = _classify_with_fallback(chief_complaint)
-        return label, confidence, True
+
+        # ================================================================
+        # MASS CASUALTY MODE
+        # ================================================================
+
+        if patient.mass_casualty_mode:
+
+            # Mass casualty mode deliberately bypasses NLP.
+            result = triage_single_mass_casualty(patient)
+
+            # Record execution latency.
+            meta.latency_ms = (
+                time.time() - start_time
+            ) * 1000
+
+            # Record metrics if enabled.
+            if config.enable_metrics:
+                record_triage_run(
+                    patient,
+                    result,
+                    meta.latency_ms,
+                )
+
+            return result, meta
+
+        # ================================================================
+        # NORMAL TRIAGE PIPELINE
+        # ================================================================
+
+        # ---------------------------------------------------------------
+        # 1. NLP classification
+        # ---------------------------------------------------------------
+
+        try:
+
+            (
+                nlp_label,
+                nlp_confidence,
+                used_fallback,
+            ) = classify_chief_complaint(
+                patient.chief_complaint
+            )
+
+            meta.nlp_label = nlp_label
+            meta.nlp_confidence = nlp_confidence
+            meta.used_nlp_fallback = used_fallback
+
+            if used_fallback:
+                meta.error_recovery_steps.append(
+                    "NLP model fallback (keyword classifier)"
+                )
+
+        except Exception as nlp_error:
+
+            # If the NLP model completely fails, do not crash the
+            # entire triage pipeline.
+            meta.error_recovery_steps.append(
+                f"NLP error recovered: "
+                f"{type(nlp_error).__name__}"
+            )
+
+            nlp_label = "Routine"
+            nlp_confidence = 0.5
+
+            meta.used_nlp_fallback = True
+            meta.nlp_label = nlp_label
+            meta.nlp_confidence = nlp_confidence
+
+        # ---------------------------------------------------------------
+        # 2. Convert NLP result to urgency score
+        # ---------------------------------------------------------------
+
+        from engine.nlp_classifier import LABEL_URGENCY_WEIGHT
+
+        nlp_urgency = round(
+            nlp_confidence
+            * LABEL_URGENCY_WEIGHT[nlp_label],
+            4,
+        )
+
+        # ---------------------------------------------------------------
+        # 3. Vital deviation
+        # ---------------------------------------------------------------
+
+        vital_dev = score_vital_deviation(
+            patient.age,
+            patient.heart_rate,
+            patient.spo2,
+            patient.temperature,
+        )
+
+        # ---------------------------------------------------------------
+        # 4. Age factor
+        # ---------------------------------------------------------------
+
+        age_factor = score_age_factor(
+            patient.age
+        )
+
+        # ---------------------------------------------------------------
+        # 5. Explainable risk calculation
+        # ---------------------------------------------------------------
+
+        risk_score, breakdown = compute_risk(
+            vital_dev,
+            nlp_urgency,
+            age_factor,
+            alpha=config.alpha,
+            beta=config.beta,
+            gamma=config.gamma,
+        )
+
+        # ---------------------------------------------------------------
+        # 6. Map risk score to ESI
+        # ---------------------------------------------------------------
+
+        esi_level = map_risk_to_esi(
+            risk_score
+        )
+
+        # ---------------------------------------------------------------
+        # 7. Automatic decision triggers
+        # ---------------------------------------------------------------
+
+        decisions = check_decide_triggers(
+            vital_dev,
+            nlp_urgency,
+            nlp_label,
+            patient.heart_rate,
+        )
+
+        # ---------------------------------------------------------------
+        # 8. Decision / recommendation coherence
+        # ---------------------------------------------------------------
+
+        if (
+            config.enable_decision_coherence_check
+            and decisions
+            and esi_level > DECIDE_TRIGGER_ESI_CEILING
+        ):
+
+            # If a critical automatic action is triggered,
+            # prevent a weaker ESI recommendation.
+            esi_level = DECIDE_TRIGGER_ESI_CEILING
+
+            meta.error_recovery_steps.append(
+                "ESI corrected for "
+                "decision-recommendation coherence"
+            )
+
+        # ---------------------------------------------------------------
+        # 9. Build final result
+        # ---------------------------------------------------------------
+
+        result = TriageResult(
+            risk_score=risk_score,
+            esi_level=esi_level,
+            decisions=decisions,
+            mass_casualty_mode=False,
+            explain=breakdown,
+            reason=None,
+        )
+
+        # ---------------------------------------------------------------
+        # 10. Record latency
+        # ---------------------------------------------------------------
+
+        meta.latency_ms = (
+            time.time() - start_time
+        ) * 1000
+
+        # ---------------------------------------------------------------
+        # 11. Record metrics
+        # ---------------------------------------------------------------
+
+        if config.enable_metrics:
+
+            record_triage_run(
+                patient,
+                result,
+                meta.latency_ms,
+                nlp_label=nlp_label,
+                nlp_confidence=nlp_confidence,
+                used_nlp_fallback=meta.used_nlp_fallback,
+            )
+
+        return result, meta
+
+    # ====================================================================
+    # FINAL ERROR HANDLER
+    # ====================================================================
+
+    except Exception as exc:
+
+        # Even failed runs have a latency value.
+        meta.latency_ms = (
+            time.time() - start_time
+        ) * 1000
+
+        raise TriageError(
+            "Triage pipeline failed to produce a result. "
+            f"Recovery attempts: "
+            f"{meta.error_recovery_steps}. "
+            f"Error: {exc}"
+        ) from exc
+</file>
+
+<file path="engine/risk_engine.py">
+"""
+engine/risk_engine.py
+
+Transparent and explainable risk engine for PatientTriage.ai.
+
+The RiskDAG combines:
+
+    Vital Deviation
+    NLP Urgency
+    Age Factor
+          ↓
+      Risk Score
+          ↓
+         ESI
+
+The decision layer separately evaluates narrow, high-confidence
+automatic actions.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from models.schemas import ExplainabilityBreakdown
 
 
-def score_nlp_urgency(chief_complaint: str) -> float:
-    """Score how urgent a patient's chief complaint sounds (0.0–1.0)."""
-    label, confidence, _ = classify_chief_complaint(chief_complaint)
-    weight = LABEL_URGENCY_WEIGHT[label]
-    return round(confidence * weight, 4)
+# ============================================================================
+# DEFAULT WEIGHTS
+# ============================================================================
+
+DEFAULT_ALPHA = 0.4
+DEFAULT_BETA = 0.4
+DEFAULT_GAMMA = 0.2
 
 
-def get_nlp_label(chief_complaint: str) -> str:
-    """Convenience accessor for just the top predicted label."""
-    label, _, _ = classify_chief_complaint(chief_complaint)
-    return label
+# ============================================================================
+# ESI THRESHOLDS
+# ============================================================================
+
+ESI_THRESHOLDS = [
+    (0.80, 1),
+    (0.60, 2),
+    (0.40, 3),
+    (0.20, 4),
+    (0.00, 5),
+]
 
 
-def get_classification_confidence(chief_complaint: str) -> float:
-    """Convenience accessor for just the confidence score."""
-    _, confidence, _ = classify_chief_complaint(chief_complaint)
-    return confidence
+# ============================================================================
+# RISK NODE
+# ============================================================================
+
+@dataclass
+class RiskNode:
+    """One node in the explainable risk DAG."""
+
+    name: str
+    value: float
+    weight: float | None = None
+
+    @property
+    def contribution(self) -> float:
+        """Weighted contribution of this node."""
+
+        if self.weight is None:
+            return self.value
+
+        return self.value * self.weight
 
 
-def classify_with_metadata(chief_complaint: str) -> dict:
-    """Full classification metadata — useful for debugging or UI tooltips."""
-    label, confidence, used_fallback = classify_chief_complaint(chief_complaint)
-    weight = LABEL_URGENCY_WEIGHT[label]
-    urgency_score = round(confidence * weight, 4)
+# ============================================================================
+# RISK DAG
+# ============================================================================
 
-    return {
-        "label": label,
-        "confidence": round(confidence, 4),
-        "urgency_score": urgency_score,
-        "used_fallback": used_fallback,
-    }
+class RiskDAG:
+    """
+    Explicit risk DAG:
+
+        Vital_Deviation ─────┐
+                             │
+        NLP_Urgency ─────────┼──> Risk_Score
+                             │
+        Age_Factor ──────────┘
+    """
+
+    def __init__(
+        self,
+        alpha: float = DEFAULT_ALPHA,
+        beta: float = DEFAULT_BETA,
+        gamma: float = DEFAULT_GAMMA,
+    ):
+        self.alpha = alpha
+        self.beta = beta
+        self.gamma = gamma
+
+    def score(
+        self,
+        vital_deviation: float,
+        nlp_urgency: float,
+        age_factor: float,
+    ) -> tuple[float, ExplainabilityBreakdown]:
+
+        nodes = [
+            RiskNode(
+                "Vital_Deviation",
+                vital_deviation,
+                self.alpha,
+            ),
+            RiskNode(
+                "NLP_Urgency",
+                nlp_urgency,
+                self.beta,
+            ),
+            RiskNode(
+                "Age_Factor",
+                age_factor,
+                self.gamma,
+            ),
+        ]
+
+        risk_score = round(
+            min(
+                1.0,
+                sum(
+                    node.contribution
+                    for node in nodes
+                ),
+            ),
+            4,
+        )
+
+        breakdown = ExplainabilityBreakdown(
+            vital_deviation=vital_deviation,
+            nlp_urgency=nlp_urgency,
+            age_factor=age_factor,
+            alpha=self.alpha,
+            beta=self.beta,
+            gamma=self.gamma,
+            alpha_contribution=round(
+                nodes[0].contribution,
+                4,
+            ),
+            beta_contribution=round(
+                nodes[1].contribution,
+                4,
+            ),
+            gamma_contribution=round(
+                nodes[2].contribution,
+                4,
+            ),
+        )
+
+        return (
+            risk_score,
+            breakdown,
+        )
+
+    def describe(self) -> str:
+        """Return a human-readable DAG description."""
+
+        return (
+            f"RiskDAG("
+            f"alpha={self.alpha}, "
+            f"beta={self.beta}, "
+            f"gamma={self.gamma}"
+            f") -> "
+            f"Risk_Score = "
+            f"alpha*Vital_Deviation + "
+            f"beta*NLP_Urgency + "
+            f"gamma*Age_Factor"
+        )
+
+
+# ============================================================================
+# PUBLIC RISK CALCULATION
+# ============================================================================
+
+def compute_risk(
+    vital_deviation: float,
+    nlp_urgency: float,
+    age_factor: float,
+    alpha: float = DEFAULT_ALPHA,
+    beta: float = DEFAULT_BETA,
+    gamma: float = DEFAULT_GAMMA,
+) -> tuple[float, ExplainabilityBreakdown]:
+    """Compute risk score and explainability breakdown."""
+
+    dag = RiskDAG(
+        alpha=alpha,
+        beta=beta,
+        gamma=gamma,
+    )
+
+    return dag.score(
+        vital_deviation,
+        nlp_urgency,
+        age_factor,
+    )
+
+
+# ============================================================================
+# ESI MAPPING
+# ============================================================================
+
+def map_risk_to_esi(
+    risk_score: float,
+) -> int:
+    """
+    Map risk score [0, 1] to ESI 1–5.
+    """
+
+    risk_score = max(
+        0.0,
+        min(
+            1.0,
+            float(risk_score),
+        ),
+    )
+
+    for threshold, esi in ESI_THRESHOLDS:
+
+        if risk_score >= threshold:
+            return esi
+
+    return 5
+
+
+# ============================================================================
+# DECISION ENGINE
+# ============================================================================
+
+def check_decide_triggers(
+    vital_deviation: float,
+    nlp_urgency: float,
+    nlp_label: str,
+    heart_rate: int,
+) -> list[str]:
+    """
+    Evaluate narrow high-confidence automatic actions.
+
+    The decision layer intentionally combines:
+        - NLP category
+        - objective physiological evidence
+
+    It does not depend on NLP urgency confidence alone.
+    """
+
+    decisions: list[str] = []
+
+    # Normalize the label defensively.
+    label = str(nlp_label).strip().lower()
+
+    # ------------------------------------------------------------------------
+    # CARDIAC
+    # ------------------------------------------------------------------------
+    #
+    # Strong cardiac category + objective abnormality.
+    #
+    # The cardiac emergency demo case:
+    #
+    #     Cardiac
+    #     HR > 120
+    #     significant vital deviation
+    #
+    # should trigger this decision.
+    #
+    if (
+        label == "cardiac"
+        and heart_rate > 120
+        and vital_deviation >= 0.5
+    ):
+        decisions.append(
+            "DECISION: Auto-order ECG + Cardiac Enzyme Panel"
+        )
+
+    # ------------------------------------------------------------------------
+    # RESPIRATORY
+    # ------------------------------------------------------------------------
+
+    elif (
+        label == "respiratory"
+        and vital_deviation >= 0.5
+    ):
+        decisions.append(
+            "DECISION: Auto-order pulse oximetry re-check + oxygen prep"
+        )
+
+    # ------------------------------------------------------------------------
+    # TRAUMA
+    # ------------------------------------------------------------------------
+
+    elif (
+        label == "trauma"
+        and vital_deviation >= 0.7
+    ):
+        decisions.append(
+            "DECISION: Flag for immediate trauma-bay routing"
+        )
+
+    return decisions
+</file>
+
+<file path=".env.example">
+# Database
+DATABASE_URL=postgresql://user:password@localhost:5432/patienttriage
+SQLALCHEMY_DATABASE_URL=postgresql://user:password@localhost:5432/patienttriage
+
+# API Settings
+API_HOST=0.0.0.0
+API_PORT=8000
+DEBUG=True
+ENVIRONMENT=development
+
+# CORS
+CORS_ORIGINS=["http://localhost:3000","http://localhost:8501"]
+
+# Authentication
+API_KEY_HEADER=X-API-Key
+SECRET_KEY=0360c251e5f3f8aea0d84f7d3dd275c8e9b7ae184ff172d826282a081342507a
+
+# NLP Settings
+NLP_MODEL=facebook/bart-large-mnli
+NLP_DEVICE=cpu
+
+# Logging
+LOG_LEVEL=INFO
 </file>
 
 <file path=".gitignore">
@@ -9045,6 +9212,503 @@ ENV/
 .coverage
 htmlcov/
 node_modules/
+</file>
+
+<file path="engine/nlp_classifier.py">
+"""
+engine/nlp_classifier.py
+
+Zero-shot NLP urgency classifier with a deterministic safety layer.
+
+Pipeline:
+    1. High-signal clinical phrase detection
+    2. Transformer zero-shot classification
+    3. Keyword fallback if the transformer is unavailable
+
+The safety layer exists because a zero-shot model can occasionally assign
+a moderate confidence to the wrong category even when the complaint contains
+a highly characteristic emergency pattern.
+
+The application remains AI-assisted:
+- Transformer NLP is still used for general complaints.
+- Deterministic safety rules only override clearly high-signal patterns.
+"""
+
+from __future__ import annotations
+
+import re
+from functools import lru_cache
+
+
+# ============================================================================
+# LABELS
+# ============================================================================
+
+LABELS = [
+    "Cardiac",
+    "Respiratory",
+    "Trauma",
+    "Routine",
+]
+
+
+# ============================================================================
+# NLP URGENCY WEIGHTS
+# ============================================================================
+
+LABEL_URGENCY_WEIGHT = {
+    "Cardiac": 1.0,
+    "Respiratory": 0.9,
+    "Trauma": 0.95,
+    "Routine": 0.05,
+}
+
+
+# ============================================================================
+# KEYWORD FALLBACK
+# ============================================================================
+
+_FALLBACK_KEYWORDS = {
+    "Cardiac": {
+        "chest": 0.30,
+        "heart": 0.30,
+        "palpitation": 0.40,
+        "tight": 0.35,
+        "pressure": 0.35,
+        "crushing": 0.50,
+        "radiating": 0.45,
+        "left arm": 0.40,
+        "shortness of breath": 0.40,
+        "syncope": 0.45,
+    },
+    "Respiratory": {
+        "breath": 0.35,
+        "breathing": 0.30,
+        "wheeze": 0.40,
+        "cough": 0.25,
+        "choking": 0.50,
+        "oxygen": 0.30,
+        "shortness": 0.45,
+        "gasping": 0.45,
+        "stridor": 0.50,
+        "throat": 0.20,
+    },
+    "Trauma": {
+        "bleeding": 0.40,
+        "fracture": 0.45,
+        "fell": 0.30,
+        "accident": 0.30,
+        "wound": 0.35,
+        "broken": 0.40,
+        "crash": 0.40,
+        "laceration": 0.40,
+        "stab": 0.55,
+        "crush": 0.50,
+    },
+}
+
+
+# ============================================================================
+# HIGH-SIGNAL SAFETY PATTERNS
+# ============================================================================
+
+# These are deliberately narrow.
+# They are NOT generic "chest pain = cardiac" rules.
+# They look for combinations of strongly characteristic language.
+
+_CARDIAC_STRONG_PATTERNS = [
+    (
+        "chest",
+        "crushing",
+    ),
+    (
+        "chest",
+        "radiating",
+    ),
+    (
+        "chest",
+        "left arm",
+    ),
+    (
+        "chest",
+        "pressure",
+    ),
+    (
+        "chest",
+        "tight",
+    ),
+    (
+        "left arm",
+        "radiating",
+    ),
+]
+
+_RESPIRATORY_STRONG_PATTERNS = [
+    (
+        "can't catch my breath",
+    ),
+    (
+        "cannot catch my breath",
+    ),
+    (
+        "gasping",
+    ),
+    (
+        "choking",
+    ),
+    (
+        "stridor",
+    ),
+    (
+        "severe wheezing",
+    ),
+    (
+        "severe shortness of breath",
+    ),
+]
+
+_TRAUMA_STRONG_PATTERNS = [
+    (
+        "heavy bleeding",
+    ),
+    (
+        "severe bleeding",
+    ),
+    (
+        "badly broken",
+    ),
+    (
+        "open fracture",
+    ),
+    (
+        "major trauma",
+    ),
+]
+
+
+# ============================================================================
+# MODEL
+# ============================================================================
+
+@lru_cache(maxsize=1)
+def _get_pipeline():
+    """
+    Lazily load the zero-shot transformer pipeline.
+
+    The pipeline is cached so the model is loaded only once per process.
+    """
+
+    from transformers import pipeline
+
+    return pipeline(
+        "zero-shot-classification",
+        model="facebook/bart-large-mnli",
+    )
+
+
+def _classify_with_model(
+    chief_complaint: str,
+) -> tuple[str, float]:
+    """Run transformer-based zero-shot classification."""
+
+    clf = _get_pipeline()
+
+    result = clf(
+        chief_complaint,
+        candidate_labels=LABELS,
+    )
+
+    return (
+        result["labels"][0],
+        float(result["scores"][0]),
+    )
+
+
+# ============================================================================
+# KEYWORD FALLBACK
+# ============================================================================
+
+def _classify_with_fallback(
+    chief_complaint: str,
+) -> tuple[str, float]:
+    """
+    Keyword-based fallback used when transformer inference fails.
+    """
+
+    text = chief_complaint.lower()
+
+    scores: dict[str, float] = {
+        "Cardiac": 0.0,
+        "Respiratory": 0.0,
+        "Trauma": 0.0,
+    }
+
+    for label, keywords in _FALLBACK_KEYWORDS.items():
+
+        for keyword, weight in keywords.items():
+
+            if re.search(
+                rf"\b{re.escape(keyword)}",
+                text,
+            ):
+                scores[label] += weight
+
+    best_label = max(
+        scores,
+        key=scores.get,
+    )
+
+    best_score = scores[best_label]
+
+    if best_score == 0:
+        return "Routine", 0.6
+
+    confidence = min(
+        0.95,
+        0.5 + (best_score * 0.25),
+    )
+
+    return (
+        best_label,
+        confidence,
+    )
+
+
+# ============================================================================
+# SAFETY CLASSIFICATION
+# ============================================================================
+
+def _contains_pattern(
+    text: str,
+    pattern: tuple[str, ...],
+) -> bool:
+    """
+    Return True if every phrase in the pattern is present.
+    """
+
+    return all(
+        phrase in text
+        for phrase in pattern
+    )
+
+
+def _classify_with_safety_rules(
+    chief_complaint: str,
+) -> tuple[str | None, float]:
+    """
+    Detect narrow, high-signal emergency language.
+
+    Returns:
+        (label, confidence)
+
+    Returns:
+        (None, 0.0) when no high-signal pattern is detected.
+    """
+
+    text = " ".join(
+        chief_complaint.lower().split()
+    )
+
+    # ------------------------------------------------------------------------
+    # CARDIAC
+    # ------------------------------------------------------------------------
+
+    for pattern in _CARDIAC_STRONG_PATTERNS:
+
+        if _contains_pattern(text, pattern):
+
+            return (
+                "Cardiac",
+                0.95,
+            )
+
+    # ------------------------------------------------------------------------
+    # RESPIRATORY
+    # ------------------------------------------------------------------------
+
+    for pattern in _RESPIRATORY_STRONG_PATTERNS:
+
+        if _contains_pattern(text, pattern):
+
+            return (
+                "Respiratory",
+                0.95,
+            )
+
+    # ------------------------------------------------------------------------
+    # TRAUMA
+    # ------------------------------------------------------------------------
+
+    for pattern in _TRAUMA_STRONG_PATTERNS:
+
+        if _contains_pattern(text, pattern):
+
+            return (
+                "Trauma",
+                0.95,
+            )
+
+    return (
+        None,
+        0.0,
+    )
+
+
+# ============================================================================
+# PUBLIC CLASSIFIER
+# ============================================================================
+
+def classify_chief_complaint(
+    chief_complaint: str,
+) -> tuple[str, float, bool]:
+    """
+    Classify a chief complaint.
+
+    Order:
+        1. High-signal safety override
+        2. Transformer model
+        3. Keyword fallback
+
+    Returns:
+        (label, confidence, used_fallback)
+    """
+
+    text = (chief_complaint or "").strip()
+
+    # Empty input should still be handled gracefully.
+    if not text:
+        return (
+            "Routine",
+            0.6,
+            True,
+        )
+
+    # ------------------------------------------------------------------------
+    # 1. HIGH-SIGNAL SAFETY OVERRIDE
+    # ------------------------------------------------------------------------
+
+    safety_label, safety_confidence = (
+        _classify_with_safety_rules(text)
+    )
+
+    if safety_label is not None:
+
+        # This is not a model failure, so keep used_fallback=False.
+        return (
+            safety_label,
+            safety_confidence,
+            False,
+        )
+
+    # ------------------------------------------------------------------------
+    # 2. TRANSFORMER MODEL
+    # ------------------------------------------------------------------------
+
+    try:
+
+        label, confidence = _classify_with_model(
+            text
+        )
+
+        return (
+            label,
+            confidence,
+            False,
+        )
+
+    except Exception:
+
+        # --------------------------------------------------------------------
+        # 3. KEYWORD FALLBACK
+        # --------------------------------------------------------------------
+
+        label, confidence = _classify_with_fallback(
+            text
+        )
+
+        return (
+            label,
+            confidence,
+            True,
+        )
+
+
+# ============================================================================
+# CONVENIENCE FUNCTIONS
+# ============================================================================
+
+def score_nlp_urgency(
+    chief_complaint: str,
+) -> float:
+    """
+    Convert classification into a single urgency score in [0, 1].
+    """
+
+    label, confidence, _ = classify_chief_complaint(
+        chief_complaint
+    )
+
+    weight = LABEL_URGENCY_WEIGHT[label]
+
+    return round(
+        confidence * weight,
+        4,
+    )
+
+
+def get_nlp_label(
+    chief_complaint: str,
+) -> str:
+    """Return only the predicted label."""
+
+    label, _, _ = classify_chief_complaint(
+        chief_complaint
+    )
+
+    return label
+
+
+def get_classification_confidence(
+    chief_complaint: str,
+) -> float:
+    """Return only the classification confidence."""
+
+    _, confidence, _ = classify_chief_complaint(
+        chief_complaint
+    )
+
+    return confidence
+
+
+def classify_with_metadata(
+    chief_complaint: str,
+) -> dict:
+    """
+    Return full classification metadata.
+    """
+
+    label, confidence, used_fallback = (
+        classify_chief_complaint(
+            chief_complaint
+        )
+    )
+
+    weight = LABEL_URGENCY_WEIGHT[label]
+
+    urgency_score = round(
+        confidence * weight,
+        4,
+    )
+
+    return {
+        "label": label,
+        "confidence": round(
+            confidence,
+            4,
+        ),
+        "urgency_score": urgency_score,
+        "used_fallback": used_fallback,
+    }
 </file>
 
 <file path="requirements.txt">
@@ -9163,6 +9827,116 @@ tqdm>=4.65.0,<5.0.0  # Progress bars
 ipython>=8.12.0,<9.0.0
 jupyter>=1.0.0,<2.0.0
 jupyterlab>=4.0.0,<5.0.0
+</file>
+
+<file path="triage_metrics.jsonl">
+{"timestamp": "2026-08-29T01:52:47.269476", "patient_age": 0, "patient_spo2": 88.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.7725, "esi_level": 2, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.7290840148925781, "nlp_label": "Respiratory", "nlp_confidence": 0.6625}
+{"timestamp": "2026-08-29T01:52:47.281183", "patient_age": 88, "patient_spo2": 96.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.216, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.19407272338867188, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:52:47.281927", "patient_age": 35, "patient_spo2": 98.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.3063, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.19621849060058594, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:52:47.284995", "patient_age": 45, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.032, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.1575946807861328, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:52:47.285649", "patient_age": 50, "patient_spo2": 99.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.2476, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.14352798461914062, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:52:47.287471", "patient_age": 30, "patient_spo2": 95.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.032, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.3802776336669922, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:52:47.287698", "patient_age": 31, "patient_spo2": 96.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.1052, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.13518333435058594, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:52:47.288359", "patient_age": 32, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.1966, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.1862049102783203, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:52:47.288574", "patient_age": 33, "patient_spo2": 98.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.032, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.12135505676269531, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:52:47.288752", "patient_age": 34, "patient_spo2": 99.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.1052, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.11897087097167969, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:52:47.289342", "patient_age": 35, "patient_spo2": 95.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.1966, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.21314620971679688, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:52:47.289581", "patient_age": 36, "patient_spo2": 96.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.032, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.1277923583984375, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:52:47.289863", "patient_age": 37, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.1052, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.12278556823730469, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:52:47.290018", "patient_age": 38, "patient_spo2": 98.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.1966, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.10776519775390625, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:52:47.290188", "patient_age": 39, "patient_spo2": 99.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.032, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.11134147644042969, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:52:47.291213", "patient_age": 60, "patient_spo2": 92.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.3718, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.1609325408935547, "nlp_label": "Cardiac", "nlp_confidence": 0.575}
+{"timestamp": "2026-08-29T01:52:47.291441", "patient_age": 60, "patient_spo2": 92.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.4734, "esi_level": 3, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.1633167266845703, "nlp_label": "Cardiac", "nlp_confidence": 0.575}
+{"timestamp": "2026-08-29T01:52:47.292022", "patient_age": 45, "patient_spo2": 96.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.065, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.13399124145507812, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:52:47.292598", "patient_age": 60, "patient_spo2": 88.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.3219, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.1316070556640625, "nlp_label": "Cardiac", "nlp_confidence": 0.575}
+{"timestamp": "2026-08-29T01:52:47.296378", "patient_age": 0, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.212, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.1697540283203125, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:52:47.296600", "patient_age": 1, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.152, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.1266002655029297, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:52:47.296752", "patient_age": 50, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.032, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.10967254638671875, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:52:47.296928", "patient_age": 100, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.212, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.13971328735351562, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:52:47.297109", "patient_age": 120, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.212, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.13566017150878906, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:52:58.757248", "patient_age": 0, "patient_spo2": 88.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.7725, "esi_level": 2, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.5831718444824219, "nlp_label": "Respiratory", "nlp_confidence": 0.6625}
+{"timestamp": "2026-08-29T01:52:58.758129", "patient_age": 88, "patient_spo2": 96.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.216, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.1671314239501953, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:52:58.758835", "patient_age": 35, "patient_spo2": 98.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.3063, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.1857280731201172, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:52:58.759475", "patient_age": 45, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.032, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.17023086547851562, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:52:58.760066", "patient_age": 50, "patient_spo2": 99.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.2476, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.15687942504882812, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:52:58.761402", "patient_age": 30, "patient_spo2": 95.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.032, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.23937225341796875, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:52:58.761616", "patient_age": 31, "patient_spo2": 96.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.1052, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.1347064971923828, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:52:58.762321", "patient_age": 32, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.1966, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.46181678771972656, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:52:58.762541", "patient_age": 35, "patient_spo2": 95.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.1966, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.5521774291992188, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:52:58.762858", "patient_age": 34, "patient_spo2": 99.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.1052, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.8749961853027344, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:52:58.763013", "patient_age": 38, "patient_spo2": 98.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.1966, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.10895729064941406, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:52:58.763156", "patient_age": 39, "patient_spo2": 99.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.032, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.10251998901367188, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:52:58.762244", "patient_age": 33, "patient_spo2": 98.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.032, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.26679039001464844, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:52:58.762744", "patient_age": 37, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.1052, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.15354156494140625, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:52:58.763420", "patient_age": 36, "patient_spo2": 96.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.032, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 1.0068416595458984, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:52:58.764315", "patient_age": 60, "patient_spo2": 92.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.3718, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.1671314239501953, "nlp_label": "Cardiac", "nlp_confidence": 0.575}
+{"timestamp": "2026-08-29T01:52:58.764537", "patient_age": 60, "patient_spo2": 92.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.4734, "esi_level": 3, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.15878677368164062, "nlp_label": "Cardiac", "nlp_confidence": 0.575}
+{"timestamp": "2026-08-29T01:52:58.765116", "patient_age": 45, "patient_spo2": 96.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.065, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.12755393981933594, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:52:58.765730", "patient_age": 60, "patient_spo2": 88.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.3219, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.141143798828125, "nlp_label": "Cardiac", "nlp_confidence": 0.575}
+{"timestamp": "2026-08-29T01:52:58.776220", "patient_age": 0, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.212, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.17571449279785156, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:52:58.776460", "patient_age": 1, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.152, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.1659393310546875, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:52:58.776628", "patient_age": 50, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.032, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.12040138244628906, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:52:58.776780", "patient_age": 100, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.212, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.11467933654785156, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:52:58.776922", "patient_age": 120, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.212, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.10800361633300781, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:53:02.745851", "patient_age": 0, "patient_spo2": 88.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.7725, "esi_level": 2, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.5676746368408203, "nlp_label": "Respiratory", "nlp_confidence": 0.6625}
+{"timestamp": "2026-08-29T01:53:02.746752", "patient_age": 88, "patient_spo2": 96.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.216, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.19478797912597656, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:53:02.747430", "patient_age": 35, "patient_spo2": 98.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.3063, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.17213821411132812, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:53:02.748016", "patient_age": 45, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.032, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.13947486877441406, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:53:02.748651", "patient_age": 50, "patient_spo2": 99.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.2476, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.1461505889892578, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:53:02.749840", "patient_age": 30, "patient_spo2": 95.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.032, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.22912025451660156, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:53:02.750043", "patient_age": 31, "patient_spo2": 96.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.1052, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.1285076141357422, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:53:02.750608", "patient_age": 32, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.1966, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.3077983856201172, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:53:02.751161", "patient_age": 33, "patient_spo2": 98.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.032, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.43487548828125, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:53:02.751333", "patient_age": 35, "patient_spo2": 95.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.1966, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.4668235778808594, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:53:02.751508", "patient_age": 38, "patient_spo2": 98.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.1966, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.13184547424316406, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:53:02.751650", "patient_age": 39, "patient_spo2": 99.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.032, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.10347366333007812, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:53:02.751786", "patient_age": 36, "patient_spo2": 96.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.032, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.9007453918457031, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:53:02.751075", "patient_age": 34, "patient_spo2": 99.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.1052, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.2727508544921875, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:53:02.751972", "patient_age": 37, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.1052, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.7548332214355469, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:53:02.752905", "patient_age": 60, "patient_spo2": 92.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.3718, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.15473365783691406, "nlp_label": "Cardiac", "nlp_confidence": 0.575}
+{"timestamp": "2026-08-29T01:53:02.753081", "patient_age": 60, "patient_spo2": 92.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.4734, "esi_level": 3, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.11992454528808594, "nlp_label": "Cardiac", "nlp_confidence": 0.575}
+{"timestamp": "2026-08-29T01:53:02.753713", "patient_age": 45, "patient_spo2": 96.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.065, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.1304149627685547, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:53:02.754277", "patient_age": 60, "patient_spo2": 88.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.3219, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.14543533325195312, "nlp_label": "Cardiac", "nlp_confidence": 0.575}
+{"timestamp": "2026-08-29T01:53:02.755033", "patient_age": 45, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.032, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.24175643920898438, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:53:02.755614", "patient_age": 0, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.212, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.1304149627685547, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:53:02.755785", "patient_age": 1, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.152, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.11420249938964844, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:53:02.755942", "patient_age": 50, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.032, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.1163482666015625, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:53:02.756087", "patient_age": 100, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.212, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.10776519775390625, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:53:02.756233", "patient_age": 120, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.212, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.11324882507324219, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:53:05.438086", "patient_age": 0, "patient_spo2": 88.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.7725, "esi_level": 2, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.18215179443359375, "nlp_label": "Respiratory", "nlp_confidence": 0.6625}
+{"timestamp": "2026-08-29T01:53:05.439065", "patient_age": 88, "patient_spo2": 96.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.216, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.19407272338867188, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:53:05.439838", "patient_age": 35, "patient_spo2": 98.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.3063, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.17952919006347656, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:53:05.440622", "patient_age": 45, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.032, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.17523765563964844, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:53:05.441320", "patient_age": 50, "patient_spo2": 99.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.2476, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.1747608184814453, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:53:05.442818", "patient_age": 30, "patient_spo2": 95.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.032, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.3237724304199219, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:53:05.443069", "patient_age": 31, "patient_spo2": 96.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.1052, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.1609325408935547, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:53:05.443691", "patient_age": 32, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.1966, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.43201446533203125, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:53:05.443936", "patient_age": 33, "patient_spo2": 98.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.032, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.1659393310546875, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:53:05.444133", "patient_age": 34, "patient_spo2": 99.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.1052, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.14472007751464844, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:53:05.444325", "patient_age": 35, "patient_spo2": 95.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.1966, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.14710426330566406, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:53:05.444674", "patient_age": 36, "patient_spo2": 96.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.032, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.15401840209960938, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:53:05.444862", "patient_age": 37, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.1052, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.1285076141357422, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:53:05.445030", "patient_age": 38, "patient_spo2": 98.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.1966, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.12469291687011719, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:53:05.445191", "patient_age": 39, "patient_spo2": 99.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.032, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.1201629638671875, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:53:05.446233", "patient_age": 60, "patient_spo2": 92.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.3718, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.1742839813232422, "nlp_label": "Cardiac", "nlp_confidence": 0.575}
+{"timestamp": "2026-08-29T01:53:05.446485", "patient_age": 60, "patient_spo2": 92.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.4734, "esi_level": 3, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.17404556274414062, "nlp_label": "Cardiac", "nlp_confidence": 0.575}
+{"timestamp": "2026-08-29T01:53:05.447214", "patient_age": 45, "patient_spo2": 96.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.065, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.15115737915039062, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:53:05.447959", "patient_age": 60, "patient_spo2": 88.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.3219, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.17833709716796875, "nlp_label": "Cardiac", "nlp_confidence": 0.575}
+{"timestamp": "2026-08-29T01:53:05.448771", "patient_age": 45, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.032, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.2789497375488281, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:53:05.449444", "patient_age": 0, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.212, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.19168853759765625, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:53:05.449654", "patient_age": 1, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.152, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.14734268188476562, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:53:05.449828", "patient_age": 50, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.032, "esi_level": 5, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.12803077697753906, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:53:05.449992", "patient_age": 100, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.212, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.12469291687011719, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-29T01:53:05.450146", "patient_age": 120, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": true, "risk_score": 0.212, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.11777877807617188, "nlp_label": "Routine", "nlp_confidence": 0.6}
+{"timestamp": "2026-08-30T14:34:00.962517", "patient_age": 45, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": false, "risk_score": 0.3358, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 10559.461832046509, "nlp_label": "Trauma", "nlp_confidence": 0.8310781717300415}
+{"timestamp": "2026-08-30T14:34:46.951613", "patient_age": 60, "patient_spo2": 90.0, "mass_casualty_mode": false, "used_nlp_fallback": false, "risk_score": 0.4162, "esi_level": 3, "decision_triggered": false, "num_decisions": 0, "latency_ms": 1145.5457210540771, "nlp_label": "Trauma", "nlp_confidence": 0.5109994411468506}
+{"timestamp": "2026-08-30T14:34:58.322283", "patient_age": 60, "patient_spo2": 90.0, "mass_casualty_mode": true, "used_nlp_fallback": false, "risk_score": 0.4038, "esi_level": 3, "decision_triggered": false, "num_decisions": 0, "latency_ms": 0.0, "nlp_label": null, "nlp_confidence": null}
+{"timestamp": "2026-08-30T15:51:22.551903", "patient_age": 60, "patient_spo2": 90.5, "mass_casualty_mode": false, "used_nlp_fallback": false, "risk_score": 0.4472, "esi_level": 3, "decision_triggered": false, "num_decisions": 0, "latency_ms": 16327.359199523926, "nlp_label": "Trauma", "nlp_confidence": 0.5109994411468506}
+{"timestamp": "2026-08-30T16:26:24.675885", "patient_age": 45, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": false, "risk_score": 0.3358, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 31336.813926696777, "nlp_label": "Trauma", "nlp_confidence": 0.8310781717300415}
+{"timestamp": "2026-08-30T16:26:31.884286", "patient_age": 45, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": false, "risk_score": 0.3358, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 2186.4540576934814, "nlp_label": "Trauma", "nlp_confidence": 0.8310781717300415}
+{"timestamp": "2026-08-30T16:26:32.581070", "patient_age": 45, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": false, "risk_score": 0.3358, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 2241.677761077881, "nlp_label": "Trauma", "nlp_confidence": 0.8310781717300415}
+{"timestamp": "2026-08-30T16:26:37.933234", "patient_age": 45, "patient_spo2": 97.0, "mass_casualty_mode": false, "used_nlp_fallback": false, "risk_score": 0.3358, "esi_level": 4, "decision_triggered": false, "num_decisions": 0, "latency_ms": 24222.20730781555, "nlp_label": "Trauma", "nlp_confidence": 0.8310781717300415}
+{"timestamp": "2026-08-30T16:28:24.466858", "patient_age": 61, "patient_spo2": 89.0, "mass_casualty_mode": false, "used_nlp_fallback": false, "risk_score": 0.6253, "esi_level": 2, "decision_triggered": true, "num_decisions": 1, "latency_ms": 0.0, "nlp_label": "Cardiac", "nlp_confidence": 0.95}
 </file>
 
 <file path="README.md">

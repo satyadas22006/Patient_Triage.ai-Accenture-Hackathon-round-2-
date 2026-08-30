@@ -1,89 +1,64 @@
-# PatientTriage.ai - Round 2 Complete
+# 🩺 PatientTriage.ai
 
-Full-stack AI-powered emergency triage system with:
-- **Backend**: FastAPI with PostgreSQL
-- **Frontend**: Streamlit web interface
-- **ML**: Custom NLP model training and deployment
-- **DevOps**: Docker, Docker Compose, GitHub Actions CI/CD
+### Explainable AI-Assisted Emergency Department Triage
 
-## Quick Start
+PatientTriage.ai is an AI-assisted emergency department triage decision-support prototype designed to help prioritize patients using information available during the first minutes of an emergency-department assessment.
 
-See `docs/SETUP_GUIDE.md` for complete installation instructions.
+The system combines:
 
-```bash
-# Backend
-cd backend
-python -m uvicorn api.main:app --reload
+- 🧠 Natural-language urgency classification
+- ❤️ Vital-sign deviation analysis
+- 👤 Age-based risk adjustment
+- 🕸️ An explicit Explainable Risk DAG
+- 🚨 Narrow, high-confidence decision triggers
+- ⚡ Deterministic Mass Casualty Mode
+- 🔍 Per-patient explainability
+- 📊 Latency and triage metrics
+- 🧪 Synthetic patient scenarios and automated tests
+- 🌐 Streamlit demonstration UI
+- 🔌 FastAPI/PostgreSQL backend architecture
+- 🐳 Docker and CI/CD scaffolding
 
-# Frontend  
-cd frontend
-streamlit run ui/app.py
+> **Medical safety notice**
+>
+> PatientTriage.ai is a research, educational and hackathon prototype.
+> It is not a medical device, does not provide autonomous medical diagnosis,
+> and must not replace qualified clinical judgment, validated emergency
+> protocols, or professional medical care.
 
-# ML Training
-python ml/training/train.py
-```
+---
 
-## Directory Structure
+# ✨ Why PatientTriage.ai?
 
-```
-patienttriage-ai-round2-complete/
-├── backend/                    # FastAPI application
-│   ├── api/main.py            # Main API endpoints
-│   ├── services/              # Business logic
-│   ├── db/                     # Database models
-│   ├── schemas/               # Pydantic schemas
-│   ├── config/                # Configuration
-│   └── middleware/            # Auth, logging, etc
-├── frontend/                   # Streamlit UI
-│   └── ui/                    # App components
-├── ml/                         # Machine learning
-│   ├── training/              # Model training pipeline
-│   └── models/                # Trained model files
-├── engine/                     # Core triage logic (from Round 1)
-├── models/                     # Data models
-├── tests/                      # Test suites
-├── devops/                     # Deployment configs
-│   ├── docker/                # Docker files
-│   └── kubernetes/            # K8s configs
-├── docs/                       # Documentation
-└── requirements.txt            # Python dependencies
-```
+Emergency departments need to make decisions quickly, often with incomplete information.
 
-## Documentation
+A useful AI-assisted triage system should not only answer:
 
-- `docs/SETUP_GUIDE.md` - Installation and setup
-- `docs/ROUND2_ROADMAP.md` - Development roadmap
-- `docs/ROUND2_IMPLEMENTATION_SUMMARY.md` - What's been built
-- `docs/README_ORIGINAL.md` - Original Round 1 documentation
+> **"How urgent is this patient?"**
 
-## Features
+It should also answer:
 
-✅ Single patient triage assessment
-✅ Batch processing (CSV upload)
-✅ Patient record management
-✅ Detailed metrics and analytics
-✅ Auto-decision triggers for critical cases
-✅ Mass casualty mode (deterministic fallback)
-✅ Live explainability dashboard
-✅ API documentation (Swagger/OpenAPI)
-✅ Production-ready with error handling
-✅ CI/CD with GitHub Actions
+> **"Why did the system reach that recommendation?"**
 
-## Running Tests
+And in a smaller number of carefully defined situations:
 
-```bash
-# All tests
-pytest tests/
+> **"Is there a narrow, high-confidence action that should be surfaced immediately?"**
 
-# With coverage
-pytest tests/ --cov=backend --cov=engine
-```
+PatientTriage.ai separates these two responsibilities.
 
-## Deployment
-
-See `devops/docker/docker-compose.dev.yml` and `Dockerfile` for containerized deployment.
-
-```bash
-docker-compose -f devops/docker/docker-compose.dev.yml up
-```
-
+```text
+                 PATIENT
+                    │
+                    ▼
+             TRIAGE ENGINE
+                    │
+          ┌─────────┴─────────┐
+          │                   │
+          ▼                   ▼
+   RECOMMENDATION          DECISION
+          │                   │
+       ESI 1–5          Narrow protocol action
+          │                   │
+          └─────────┬─────────┘
+                    ▼
+             CLINICAL REVIEW
