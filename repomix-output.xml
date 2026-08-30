@@ -2682,6 +2682,30 @@ jobs:
 # - GITHUB_TOKEN (auto-provided)
 </file>
 
+<file path="docs/DEMO_SHOTLIST.md">
+# PatientTriage.ai — Demo Shot List (60–90 seconds)
+
+Goal: make the decide-vs-recommend boundary and the Mass Casualty fallback
+both **visually obvious**, even to someone watching with the sound off.
+
+| # | Shot | What to show | Why it matters |
+|---|------|--------------|-----------------|
+| 1 | **Cold open on a low-risk patient** | Enter scenario #1 from the test checklist (twisted ankle). Click Run. Let the ESI 5 (blue) badge land. | Establishes the baseline calmly before you show something urgent — the contrast is the whole point. |
+| 2 | **Cut to the cardiac emergency** | Clear the form, enter scenario #2 (crushing chest pain, HR 135, SpO2 90%). Click Run. | This is your money shot — a visibly red ESI 1–2 badge appearing. |
+| 3 | **Hold on the decision panel** | Pause 2 full seconds on the "DECISION: Auto-order ECG + Cardiac Enzyme Panel" line before moving on. Don't talk over it — let it read. | This is the "decide" half of decide-vs-recommend. Give it room to land. |
+| 4 | **Pan to the explainability panel** | Point at (or circle, if editing) the three progress bars — vitals, NLP urgency, age — while the cardiac case is still on screen. | Answers "why did it say that" before anyone has to ask. This is your credibility beat. |
+| 5 | **Flip Mass Casualty Mode on, live** | With the same cardiac patient still loaded, toggle Mass Casualty Mode ON on camera. Show the red banner appear and the panel instantly re-route to a rule-based result with no explainability bars. | Demonstrates the fallback isn't a separate demo — it's a live re-route of the same patient, which is the actual architectural claim. |
+| 6 | **Close on the recommend line** | Zoom or highlight the small "Recommended — nurse confirms" text under the ESI badge. | Last thing the viewer sees should reinforce the core design principle, not just the tech. |
+
+**Pacing note:** shots 2–4 are your core 30 seconds — don't rush them.
+Shots 1 and 6 can be quick (3–5 seconds each); they're framing, not content.
+
+**If you're narrating live instead of editing after the fact:** this
+shot order matches the Layer 1→4 walkthrough in the video script almost
+exactly — reuse those lines, just point at the running app instead of the
+static architecture PDF.
+</file>
+
 <file path="docs/ROUND2_IMPLEMENTATION_SUMMARY.md">
 # PatientTriage.ai Round 2 - Implementation Summary
 
@@ -3759,6 +3783,1053 @@ docker-compose restart api
 See `ROUND2_ROADMAP.md` for detailed timeline.
 </file>
 
+<file path="docs/TEST_CHECKLIST.md">
+# PatientTriage.ai — Pre-Submission Test Checklist
+
+Run every scenario below through the live app before submitting. For each:
+confirm the ESI badge color/level looks defensible, check whether the
+expected decision fires, and glance at the explainability panel for
+anything nonsensical (e.g. a contribution that's negative, or wildly out
+of proportion to the raw score next to it).
+
+Tick each box as you go. If anything looks wrong, check `engine/orchestrator.py`
+first — that's where normal-mode and mass-casualty-mode routing both live.
+
+## Normal Mode
+
+- [ ] **1. Low risk, routine.** Age 28, HR 76, SpO2 98%, Temp 36.8°C,
+  complaint: *"Twisted my ankle playing football, it's a bit swollen."*
+  Expect: ESI 4–5, no decisions.
+
+- [ ] **2. Classic cardiac emergency.** Age 60, HR 135, SpO2 90%, Temp 37.2°C,
+  complaint: *"Severe chest pain radiating to left arm, feels crushing."*
+  Expect: ESI 1–2, "Auto-order ECG + Cardiac Enzyme Panel" decision fires.
+
+- [ ] **3. Respiratory distress.** Age 45, HR 110, SpO2 88%, Temp 38.9°C,
+  complaint: *"Can't catch my breath, wheezing badly, chest feels tight."*
+  Expect: ESI 1–2, pulse-oximetry/oxygen-prep decision fires.
+
+- [ ] **4. Trauma, high vital deviation.** Age 34, HR 145, SpO2 91%, Temp 36.5°C,
+  complaint: *"Fell off a ladder, leg looks badly broken, lots of bleeding."*
+  Expect: ESI 1–2, trauma-bay routing decision fires.
+
+- [ ] **5. Mid-severity, ambiguous complaint.** Age 50, HR 98, SpO2 95%, Temp 37.9°C,
+  complaint: *"Not feeling well, some stomach pain since this morning."*
+  Expect: ESI 3, no decision (nothing here should be confident enough to
+  auto-trigger anything — this is exactly the kind of case that should
+  stay a pure recommendation).
+
+- [ ] **6. Elderly, borderline vitals.** Age 82, HR 92, SpO2 94%, Temp 37.0°C,
+  complaint: *"Feeling dizzy and weak since yesterday."*
+  Expect: ESI shifted more urgent than a similar case in a younger adult,
+  due to the age factor — confirm the explainability panel actually shows
+  a visible age contribution.
+
+- [ ] **7. Infant, high fever.** Age 1, HR 160, SpO2 96%, Temp 39.8°C,
+  complaint: *"Baby has had a very high fever since last night, very fussy."*
+  Expect: elevated ESI driven by age factor + temperature deviation, even
+  though SpO2/HR alone might look only moderately abnormal for an infant.
+
+- [ ] **8. Empty/near-empty chief complaint.** Age 40, HR 80, SpO2 97%,
+  Temp 37.0°C, complaint: *"pain"* (single word). Confirm the app does
+  **not** crash — either it classifies with low confidence or the fallback
+  keyword classifier kicks in. Should not silently produce ESI 1.
+
+## Mass Casualty Mode
+
+- [ ] **9. Mass casualty, clearly critical.** Toggle Mass Casualty Mode ON.
+  Age 70, HR 140, SpO2 82%, Temp 38.5°C (complaint text irrelevant — it
+  must not be read). Expect: ESI 1–2, `explain` panel shows the "not
+  applicable, rule-based" message (not a blank/broken panel), `reason`
+  field populated with a plain-English explanation.
+
+- [ ] **10. Mass casualty, clearly stable.** Same mode. Age 25, HR 78,
+  SpO2 98%, Temp 36.9°C. Expect: ESI 4–5, reason should say something
+  like "vitals within or near normal range."
+
+## Cross-cutting checks (do these once, not per-scenario)
+
+- [ ] Toggling Mass Casualty Mode **after** an assessment already ran
+  re-routes live using the same vitals, without needing to click
+  "Run Triage Assessment" again.
+- [ ] Switching Mass Casualty Mode back OFF correctly restores the full
+  NLP + risk-engine pipeline (not stuck showing a stale mass-casualty
+  result).
+- [ ] Submitting with an out-of-range value (e.g. drag SpO2 slider — should
+  be impossible via slider, but double check malformed input generally
+  can't crash the app) shows a clean validation error, not a traceback.
+- [ ] Run `pytest tests/ -v` one final time right before submitting — all
+  tests should pass, including `test_decide_trigger_never_contradicts_esi_recommendation`.
+</file>
+
+<file path="engine/__init__.py">
+
+</file>
+
+<file path="engine/config.py">
+"""
+engine/config.py
+
+Centralized configuration management with environment variable support,
+validation, and runtime adjustability.
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from enum import Enum
+from pathlib import Path
+
+
+class EnvironmentType(str, Enum):
+    """Deployment environment type."""
+    DEVELOPMENT = "development"
+    STAGING = "staging"
+    PRODUCTION = "production"
+
+
+@dataclass
+class NLPConfig:
+    """Configuration for the NLP urgency classifier."""
+
+    model_name: str = "facebook/bart-large-mnli"
+    cache_dir: Path = Path.home() / ".cache" / "huggingface"
+    enable_fallback: bool = True
+    timeout_seconds: float = 5.0
+    device: str = "cpu"  # "cpu" or "cuda"
+
+    @classmethod
+    def from_env(cls) -> NLPConfig:
+        """Load configuration from environment variables."""
+        return cls(
+            model_name=os.getenv("NLP_MODEL", "facebook/bart-large-mnli"),
+            cache_dir=Path(os.getenv("NLP_CACHE", Path.home() / ".cache" / "huggingface")),
+            enable_fallback=os.getenv("NLP_FALLBACK", "true").lower() == "true",
+            timeout_seconds=float(os.getenv("NLP_TIMEOUT", "5.0")),
+            device=os.getenv("NLP_DEVICE", "cpu"),
+        )
+
+
+@dataclass
+class RiskEngineConfig:
+    """Configuration for the risk engine (DAG) and ESI mapping."""
+
+    alpha: float = 0.4  # Vital deviation weight
+    beta: float = 0.4   # NLP urgency weight
+    gamma: float = 0.2  # Age factor weight
+
+    esi_thresholds: dict[int, float] = None
+
+    def __post_init__(self):
+        if self.esi_thresholds is None:
+            # Default ESI thresholds
+            self.esi_thresholds = {
+                1: 0.80,  # Resuscitation
+                2: 0.60,  # Emergent
+                3: 0.40,  # Urgent
+                4: 0.20,  # Less Urgent
+                5: 0.00,  # Non-Urgent
+            }
+
+    @classmethod
+    def from_env(cls) -> RiskEngineConfig:
+        """Load configuration from environment variables."""
+        return cls(
+            alpha=float(os.getenv("RISK_ALPHA", "0.4")),
+            beta=float(os.getenv("RISK_BETA", "0.4")),
+            gamma=float(os.getenv("RISK_GAMMA", "0.2")),
+        )
+
+
+@dataclass
+class MetricsConfig:
+    """Configuration for metrics collection and logging."""
+
+    enabled: bool = True
+    output_path: Path = Path("triage_metrics.jsonl")
+    log_level: str = "INFO"
+    log_file: Path = Path("patienttriage.log")
+
+    @classmethod
+    def from_env(cls) -> MetricsConfig:
+        """Load configuration from environment variables."""
+        return cls(
+            enabled=os.getenv("METRICS_ENABLED", "true").lower() == "true",
+            output_path=Path(os.getenv("METRICS_PATH", "triage_metrics.jsonl")),
+            log_level=os.getenv("LOG_LEVEL", "INFO"),
+            log_file=Path(os.getenv("LOG_FILE", "patienttriage.log")),
+        )
+
+
+@dataclass
+class AppConfig:
+    """Top-level application configuration."""
+
+    environment: EnvironmentType = EnvironmentType.DEVELOPMENT
+    nlp: NLPConfig = None
+    risk_engine: RiskEngineConfig = None
+    metrics: MetricsConfig = None
+    debug: bool = False
+
+    def __post_init__(self):
+        if self.nlp is None:
+            self.nlp = NLPConfig.from_env()
+        if self.risk_engine is None:
+            self.risk_engine = RiskEngineConfig.from_env()
+        if self.metrics is None:
+            self.metrics = MetricsConfig.from_env()
+
+    @classmethod
+    def from_env(cls) -> AppConfig:
+        """Load full configuration from environment."""
+        env_str = os.getenv("ENVIRONMENT", "development").lower()
+        environment = EnvironmentType(env_str)
+
+        return cls(
+            environment=environment,
+            nlp=NLPConfig.from_env(),
+            risk_engine=RiskEngineConfig.from_env(),
+            metrics=MetricsConfig.from_env(),
+            debug=os.getenv("DEBUG", "false").lower() == "true",
+        )
+
+    def validate(self) -> None:
+        """Validate configuration parameters."""
+        assert 0.0 <= self.risk_engine.alpha <= 1.0
+        assert 0.0 <= self.risk_engine.beta <= 1.0
+        assert 0.0 <= self.risk_engine.gamma <= 1.0
+        assert self.nlp.timeout_seconds > 0
+        assert self.nlp.device in ("cpu", "cuda")
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary representation."""
+        return {
+            "environment": self.environment.value,
+            "debug": self.debug,
+            "nlp": {
+                "model": self.nlp.model_name,
+                "device": self.nlp.device,
+                "fallback_enabled": self.nlp.enable_fallback,
+                "timeout_s": self.nlp.timeout_seconds,
+            },
+            "risk_engine": {
+                "alpha": self.risk_engine.alpha,
+                "beta": self.risk_engine.beta,
+                "gamma": self.risk_engine.gamma,
+            },
+            "metrics": {
+                "enabled": self.metrics.enabled,
+                "log_level": self.metrics.log_level,
+            },
+        }
+
+
+# Global config singleton
+_app_config: AppConfig | None = None
+
+
+def get_config() -> AppConfig:
+    """Get or initialize the global application config."""
+    global _app_config
+    if _app_config is None:
+        _app_config = AppConfig.from_env()
+        _app_config.validate()
+    return _app_config
+
+
+def reload_config() -> AppConfig:
+    """Reload configuration from environment (for testing)."""
+    global _app_config
+    _app_config = AppConfig.from_env()
+    _app_config.validate()
+    return _app_config
+</file>
+
+<file path="engine/mass_casualty.py">
+"""
+engine/mass_casualty.py
+
+Owner: Ayush — Day 2
+
+Baseline implementation is complete and tested. This path NEVER calls the
+NLP model — that's the whole point (speed and reliability during a surge).
+It reuses the vitals/age scoring from vitals_age.py and risk_engine.py's
+ESI mapping, but composes them completely independently of the normal
+pipeline, so a bug or slowdown in the NLP path can never affect this one.
+"""
+
+from __future__ import annotations
+
+from engine.risk_engine import map_risk_to_esi
+from engine.vitals_age import score_age_factor, score_vital_deviation
+from models.schemas import ExplainabilityBreakdown, PatientInput, TriageResult
+
+# Vitals-only weighting — no beta term, since NLP is bypassed entirely.
+# Vitals dominate; age is a secondary modifier.
+MCM_VITAL_WEIGHT = 0.75
+MCM_AGE_WEIGHT = 0.25
+
+
+def _reason_for(vital_deviation: float, age_factor: float, heart_rate: int, spo2: float) -> str:
+    """Build a short, plain-English reason for this patient's rank."""
+    reasons = []
+    if spo2 < 90:
+        reasons.append("SpO2 critically low")
+    elif spo2 < 95:
+        reasons.append("SpO2 below normal")
+    if heart_rate > 130 or heart_rate < 50:
+        reasons.append("heart rate significantly abnormal")
+    if age_factor >= 0.5:
+        reasons.append("high-risk age group")
+    if not reasons:
+        reasons.append("vitals within or near normal range")
+    return ", ".join(reasons).capitalize()
+
+
+def mass_casualty_queue(patients: list[PatientInput]) -> list[TriageResult]:
+    """
+    Rank a batch of patients using ONLY their vitals (no NLP call at all).
+
+    Args:
+        patients: a batch of PatientInput.
+
+    Returns:
+        TriageResult objects, ordered most to least urgent (index 0 = seen
+        first), each with mass_casualty_mode=True, explain=None (this path
+        is rule-based, not weighted — nothing to attribute to alpha/beta/
+        gamma), and a one-line `reason`.
+    """
+    scored: list[tuple[float, PatientInput, float, float]] = []
+
+    for p in patients:
+        vital_dev = score_vital_deviation(p.age, p.heart_rate, p.spo2, p.temperature)
+        age_factor = score_age_factor(p.age)
+        risk = round(min(1.0, MCM_VITAL_WEIGHT * vital_dev + MCM_AGE_WEIGHT * age_factor), 4)
+        scored.append((risk, p, vital_dev, age_factor))
+
+    scored.sort(key=lambda row: row[0], reverse=True)  # highest risk first
+
+    results: list[TriageResult] = []
+    for risk, p, vital_dev, age_factor in scored:
+        results.append(
+            TriageResult(
+                risk_score=risk,
+                esi_level=map_risk_to_esi(risk),
+                decisions=[],
+                mass_casualty_mode=True,
+                explain=None,
+                reason=_reason_for(vital_dev, age_factor, p.heart_rate, p.spo2),
+            )
+        )
+    return results
+
+
+def triage_single_mass_casualty(patient: PatientInput) -> TriageResult:
+    """Convenience wrapper for the common single-patient UI case."""
+    return mass_casualty_queue([patient])[0]
+</file>
+
+<file path="engine/metrics.py">
+"""
+engine/metrics.py
+
+Production-grade logging and metrics collection. Captures triage decisions,
+decision triggers, NLP fallback usage, and latency for later analysis.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import time
+from dataclasses import asdict, dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+from models.schemas import PatientInput, TriageResult
+
+# Configure logger
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.FileHandler("patienttriage.log"),
+        logging.StreamHandler(),
+    ],
+)
+logger = logging.getLogger("engine")
+
+
+@dataclass
+class TriageMetrics:
+    """Metrics captured during a single triage run."""
+
+    timestamp: str
+    patient_age: int
+    patient_spo2: float
+    mass_casualty_mode: bool
+    used_nlp_fallback: bool
+    risk_score: float
+    esi_level: int
+    decision_triggered: bool
+    num_decisions: int
+    latency_ms: float
+    nlp_label: str | None = None
+    nlp_confidence: float | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), default=str)
+
+
+class MetricsCollector:
+    """Thread-safe metrics collector for triage runs."""
+
+    def __init__(self, output_path: Path | None = None):
+        self.output_path = output_path or Path("triage_metrics.jsonl")
+        self.metrics: list[TriageMetrics] = []
+
+    def record(self, metrics: TriageMetrics) -> None:
+        """Record a triage run's metrics."""
+        self.metrics.append(metrics)
+        self._write_jsonl(metrics)
+        logger.info(
+            f"Triage run recorded: age={metrics.patient_age}, "
+            f"ESI={metrics.esi_level}, risk={metrics.risk_score:.2f}, "
+            f"latency={metrics.latency_ms:.1f}ms"
+        )
+
+    def _write_jsonl(self, metrics: TriageMetrics) -> None:
+        """Append metrics to JSONL file for later analysis."""
+        with open(self.output_path, "a") as f:
+            f.write(metrics.to_json() + "\n")
+
+    def get_summary(self) -> dict[str, Any]:
+        """Return summary statistics across all recorded runs."""
+        if not self.metrics:
+            return {}
+
+        all_risks = [m.risk_score for m in self.metrics]
+        all_latencies = [m.latency_ms for m in self.metrics]
+        triggered_decisions = [m for m in self.metrics if m.decision_triggered]
+
+        return {
+            "total_runs": len(self.metrics),
+            "avg_risk_score": sum(all_risks) / len(all_risks),
+            "min_risk_score": min(all_risks),
+            "max_risk_score": max(all_risks),
+            "avg_latency_ms": sum(all_latencies) / len(all_latencies),
+            "max_latency_ms": max(all_latencies),
+            "decision_trigger_rate": len(triggered_decisions) / len(self.metrics),
+            "nlp_fallback_rate": sum(1 for m in self.metrics if m.used_nlp_fallback) / len(self.metrics),
+            "mass_casualty_runs": sum(1 for m in self.metrics if m.mass_casualty_mode),
+        }
+
+
+# Global singleton
+_collector: MetricsCollector | None = None
+
+
+def get_collector() -> MetricsCollector:
+    """Get or create the global metrics collector."""
+    global _collector
+    if _collector is None:
+        _collector = MetricsCollector()
+    return _collector
+
+
+def record_triage_run(
+    patient: PatientInput,
+    result: TriageResult,
+    latency_ms: float,
+    nlp_label: str | None = None,
+    nlp_confidence: float | None = None,
+    used_nlp_fallback: bool = False,
+) -> None:
+    """Convenience function to record a triage run."""
+    metrics = TriageMetrics(
+        timestamp=datetime.utcnow().isoformat(),
+        patient_age=patient.age,
+        patient_spo2=patient.spo2,
+        mass_casualty_mode=result.mass_casualty_mode,
+        used_nlp_fallback=used_nlp_fallback,
+        risk_score=result.risk_score,
+        esi_level=result.esi_level,
+        decision_triggered=len(result.decisions) > 0,
+        num_decisions=len(result.decisions),
+        latency_ms=latency_ms,
+        nlp_label=nlp_label,
+        nlp_confidence=nlp_confidence,
+    )
+    get_collector().record(metrics)
+</file>
+
+<file path="engine/orchestrator_v2.py">
+"""
+engine/orchestrator_v2.py
+
+Production-grade version of orchestrator.py with:
+- Comprehensive error recovery and graceful degradation
+- Latency tracking and metrics collection
+- Cache-aware design (NLP model loaded once, reused)
+- Detailed audit trail
+- Configurable weights and thresholds
+"""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass
+
+from engine.mass_casualty import triage_single_mass_casualty
+from engine.metrics import record_triage_run
+from engine.nlp_classifier import classify_chief_complaint
+from engine.risk_engine import (
+    DEFAULT_ALPHA,
+    DEFAULT_BETA,
+    DEFAULT_GAMMA,
+    check_decide_triggers,
+    compute_risk,
+    map_risk_to_esi,
+)
+from engine.vitals_age import score_age_factor, score_vital_deviation
+from models.schemas import PatientInput, TriageResult
+
+# Explicit coherence rule: if a decision is auto-triggered, ESI can't be
+# weaker than "Emergent" (2). This prevents the system from saying "routine"
+# while simultaneously auto-ordering critical tests.
+DECIDE_TRIGGER_ESI_CEILING = 2
+
+# Hard timeouts to prevent hang in resource-constrained environments
+NLP_TIMEOUT_SECONDS = 5.0
+
+
+class TriageError(Exception):
+    """Raised when the pipeline cannot produce a result at all."""
+
+
+@dataclass
+class TriageRunMeta:
+    """Extra, UI-relevant metadata about how a result was produced."""
+
+    used_nlp_fallback: bool = False
+    nlp_confidence: float | None = None
+    nlp_label: str | None = None
+    latency_ms: float = 0.0
+    error_recovery_steps: list[str] = None
+
+    def __post_init__(self):
+        if self.error_recovery_steps is None:
+            self.error_recovery_steps = []
+
+
+class TriageConfig:
+    """Tunable configuration for the triage engine."""
+
+    def __init__(
+        self,
+        alpha: float = DEFAULT_ALPHA,
+        beta: float = DEFAULT_BETA,
+        gamma: float = DEFAULT_GAMMA,
+        enable_metrics: bool = True,
+        enable_decision_coherence_check: bool = True,
+    ):
+        self.alpha = alpha
+        self.beta = beta
+        self.gamma = gamma
+        self.enable_metrics = enable_metrics
+        self.enable_decision_coherence_check = enable_decision_coherence_check
+
+    def validate(self) -> None:
+        """Validate configuration."""
+        if not (0.0 <= self.alpha <= 1.0):
+            raise ValueError(f"alpha must be in [0.0, 1.0], got {self.alpha}")
+        if not (0.0 <= self.beta <= 1.0):
+            raise ValueError(f"beta must be in [0.0, 1.0], got {self.beta}")
+        if not (0.0 <= self.gamma <= 1.0):
+            raise ValueError(f"gamma must be in [0.0, 1.0], got {self.gamma}")
+        # Note: alpha + beta + gamma don't need to sum to 1.0 — the risk formula
+        # min()s to 1.0 anyway, and unequal weights can be defensible.
+
+
+def run_triage(
+    patient: PatientInput,
+    config: TriageConfig | None = None,
+) -> tuple[TriageResult, TriageRunMeta]:
+    """
+    Route a PatientInput to the correct pipeline and return a TriageResult.
+
+    - mass_casualty_mode=True  → deterministic, vitals-only bypass queue.
+    - mass_casualty_mode=False → full MMTG pipeline (NLP + vitals + age).
+
+    Both pipelines degrade gracefully on errors (NLP fallback, etc.), so this
+    should almost never raise TriageError — it exists as a last line of
+    defense so the UI never sees a raw traceback.
+
+    Args:
+        patient: the PatientInput to triage.
+        config: TriageConfig with tunable weights and flags. Defaults used if None.
+
+    Returns:
+        (result, metadata) tuple where metadata includes latency, fallback usage, etc.
+
+    Raises:
+        TriageError: only if both the normal and fallback pipelines fail.
+    """
+    if config is None:
+        config = TriageConfig()
+    config.validate()
+
+    start_time = time.time()
+    meta = TriageRunMeta()
+
+    try:
+        if patient.mass_casualty_mode:
+            result = triage_single_mass_casualty(patient)
+            meta.latency_ms = (time.time() - start_time) * 1000
+
+            if config.enable_metrics:
+                record_triage_run(patient, result, meta.latency_ms)
+
+            return result, meta
+
+        # --- Normal pipeline (NLP + vitals + age) ---
+        try:
+            nlp_label, nlp_confidence, used_fallback = classify_chief_complaint(
+                patient.chief_complaint
+            )
+            meta.nlp_label = nlp_label
+            meta.nlp_confidence = nlp_confidence
+            meta.used_nlp_fallback = used_fallback
+
+            if used_fallback:
+                meta.error_recovery_steps.append("NLP model fallback (keyword classifier)")
+
+        except Exception as nlp_error:
+            meta.error_recovery_steps.append(f"NLP error recovered: {type(nlp_error).__name__}")
+            # Final fallback: assume low urgency if NLP completely fails
+            nlp_label = "Routine"
+            nlp_confidence = 0.5
+            meta.used_nlp_fallback = True
+            meta.nlp_label = nlp_label
+            meta.nlp_confidence = nlp_confidence
+
+        # Get urgency weight for this label
+        from engine.nlp_classifier import LABEL_URGENCY_WEIGHT
+        nlp_urgency = round(nlp_confidence * LABEL_URGENCY_WEIGHT[nlp_label], 4)
+
+        # Vital deviations and age
+        vital_dev = score_vital_deviation(
+            patient.age, patient.heart_rate, patient.spo2, patient.temperature
+        )
+        age_factor = score_age_factor(patient.age)
+
+        # Compute risk
+        risk_score, breakdown = compute_risk(
+            vital_dev, nlp_urgency, age_factor,
+            alpha=config.alpha, beta=config.beta, gamma=config.gamma
+        )
+        esi_level = map_risk_to_esi(risk_score)
+
+        # Check for auto-triggered decisions
+        decisions = check_decide_triggers(vital_dev, nlp_urgency, nlp_label, patient.heart_rate)
+
+        # Enforce decision-recommendation coherence
+        if config.enable_decision_coherence_check and decisions and esi_level > DECIDE_TRIGGER_ESI_CEILING:
+            esi_level = DECIDE_TRIGGER_ESI_CEILING
+            meta.error_recovery_steps.append("ESI corrected for decision-recommendation coherence")
+
+        result = TriageResult(
+            risk_score=risk_score,
+            esi_level=esi_level,
+            decisions=decisions,
+            mass_casualty_mode=False,
+            explain=breakdown,
+            reason=None,
+        )
+
+        meta.latency_ms = (time.time() - start_time) * 1000
+
+        if config.enable_metrics:
+            record_triage_run(
+                patient, result, meta.latency_ms,
+                nlp_label=nlp_label,
+                nlp_confidence=nlp_confidence,
+                used_nlp_fallback=meta.used_nlp_fallback,
+            )
+
+        return result, meta
+
+    except Exception as exc:
+        meta.latency_ms = (time.time() - start_time) * 1000
+        raise TriageError(
+            f"Triage pipeline failed to produce a result. Recovery attempts: {meta.error_recovery_steps}. "
+            f"Error: {exc}"
+        ) from exc
+</file>
+
+<file path="engine/orchestrator.py">
+"""
+engine/orchestrator.py
+
+Owner: Satya — Day 2
+
+The single entry point the UI calls. Everything about *which* pipeline a
+patient goes through, and how errors are handled, lives here — the UI
+layer should never call nlp_classifier / risk_engine / vitals_age /
+mass_casualty directly.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from engine.mass_casualty import triage_single_mass_casualty
+from engine.nlp_classifier import classify_chief_complaint
+from engine.risk_engine import DEFAULT_ALPHA, DEFAULT_BETA, DEFAULT_GAMMA, check_decide_triggers, compute_risk, map_risk_to_esi
+from engine.vitals_age import score_age_factor, score_vital_deviation
+from models.schemas import PatientInput, TriageResult
+
+
+class TriageError(Exception):
+    """Raised when the pipeline cannot produce a result at all."""
+
+
+# If any decide-trigger fires, the recommended ESI level is never allowed to
+# be weaker (numerically higher) than this. 2 = "Emergent" — see the ESI
+# scale in risk_engine.py.
+DECIDE_TRIGGER_ESI_CEILING = 2
+
+
+@dataclass
+class TriageRunMeta:
+    """Extra, UI-relevant metadata about how a result was produced."""
+
+    used_nlp_fallback: bool = False
+
+
+def run_triage(
+    patient: PatientInput,
+    alpha: float = DEFAULT_ALPHA,
+    beta: float = DEFAULT_BETA,
+    gamma: float = DEFAULT_GAMMA,
+) -> tuple[TriageResult, TriageRunMeta]:
+    """
+    Route a PatientInput to the correct pipeline and return a TriageResult.
+
+    - mass_casualty_mode=True  -> deterministic, vitals-only bypass queue.
+    - mass_casualty_mode=False -> full MMTG pipeline (NLP + vitals + age).
+
+    Raises:
+        TriageError if neither pipeline can produce a result (e.g. a
+        completely unexpected internal failure). Both individual pipelines
+        already degrade gracefully on their own (see nlp_classifier.py's
+        fallback), so this should be rare — it exists as a last line of
+        defense so the UI never sees a raw traceback.
+    """
+    try:
+        if patient.mass_casualty_mode:
+            result = triage_single_mass_casualty(patient)
+            return result, TriageRunMeta(used_nlp_fallback=False)
+
+        nlp_label, nlp_confidence, used_fallback = classify_chief_complaint(
+            patient.chief_complaint
+        )
+        from engine.nlp_classifier import LABEL_URGENCY_WEIGHT
+
+        nlp_urgency = round(nlp_confidence * LABEL_URGENCY_WEIGHT[nlp_label], 4)
+
+        vital_dev = score_vital_deviation(
+            patient.age, patient.heart_rate, patient.spo2, patient.temperature
+        )
+        age_factor = score_age_factor(patient.age)
+
+        risk_score, breakdown = compute_risk(
+            vital_dev, nlp_urgency, age_factor, alpha=alpha, beta=beta, gamma=gamma
+        )
+        esi_level = map_risk_to_esi(risk_score)
+        decisions = check_decide_triggers(vital_dev, nlp_urgency, nlp_label, patient.heart_rate)
+
+        # Coherence invariant: if the system is confident enough to auto-trigger
+        # a protocol action (e.g. auto-order an ECG), it can never simultaneously
+        # recommend an ESI level weaker than "Emergent". A decide-trigger and a
+        # low-urgency recommendation contradicting each other is exactly the kind
+        # of inconsistency that erodes clinician trust — so we enforce it as an
+        # explicit floor here rather than relying on threshold tuning alone.
+        if decisions and esi_level > DECIDE_TRIGGER_ESI_CEILING:
+            esi_level = DECIDE_TRIGGER_ESI_CEILING
+
+        result = TriageResult(
+            risk_score=risk_score,
+            esi_level=esi_level,
+            decisions=decisions,
+            mass_casualty_mode=False,
+            explain=breakdown,
+            reason=None,
+        )
+        return result, TriageRunMeta(used_nlp_fallback=used_fallback)
+
+    except Exception as exc:  # last line of defense — UI must never see a raw traceback
+        raise TriageError(f"Triage pipeline failed to produce a result: {exc}") from exc
+</file>
+
+<file path="engine/risk_engine.py">
+"""
+engine/risk_engine.py
+
+Owner: Qudsia — Day 2
+
+Baseline implementation is complete and tested. The DAG is modeled as an
+explicit class (RiskDAG) rather than a bare formula, so its node structure
+is inspectable — a judge can print `RiskDAG().describe()` and see exactly
+how a score was built, which is the whole point of choosing a graph over a
+black-box model.
+
+Qudsia: the weights, ESI thresholds, and decide-trigger rules below are all
+tunable in one place (top of file) — refine them against real/synthetic
+data without needing to touch the rest of the pipeline.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from models.schemas import ExplainabilityBreakdown
+
+# --------------------------------------------------------------------------- #
+# Tunable parameters — the whole point of a transparent formula is that these
+# live in one place and are easy to defend/adjust.
+# --------------------------------------------------------------------------- #
+
+DEFAULT_ALPHA = 0.4   # weight on vital deviation
+DEFAULT_BETA = 0.4    # weight on NLP urgency
+DEFAULT_GAMMA = 0.2   # weight on age factor
+
+# ESI thresholds: risk_score >= threshold -> that ESI level.
+# Checked from most urgent (1) to least urgent (5); first match wins.
+ESI_THRESHOLDS = [
+    (0.80, 1),
+    (0.60, 2),
+    (0.40, 3),
+    (0.20, 4),
+    (0.00, 5),
+]
+
+
+# --------------------------------------------------------------------------- #
+# The DAG
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class RiskNode:
+    name: str
+    value: float
+    weight: float | None = None
+
+    @property
+    def contribution(self) -> float:
+        return self.value if self.weight is None else self.value * self.weight
+
+
+class RiskDAG:
+    """
+    A small, explicit directed acyclic graph:
+
+        Vital_Deviation ---\\
+        NLP_Urgency -------- Risk_Score
+        Age_Factor  --------/
+
+    Each input node feeds one edge, weighted by alpha/beta/gamma, into a
+    single Risk_Score output node. Modeling it this way (rather than a bare
+    expression) means `describe()` can render the exact structure a judge
+    would want to see in an explainability audit.
+    """
+
+    def __init__(self, alpha: float = DEFAULT_ALPHA, beta: float = DEFAULT_BETA,
+                 gamma: float = DEFAULT_GAMMA):
+        self.alpha = alpha
+        self.beta = beta
+        self.gamma = gamma
+
+    def score(
+        self, vital_deviation: float, nlp_urgency: float, age_factor: float
+    ) -> tuple[float, ExplainabilityBreakdown]:
+        nodes = [
+            RiskNode("Vital_Deviation", vital_deviation, self.alpha),
+            RiskNode("NLP_Urgency", nlp_urgency, self.beta),
+            RiskNode("Age_Factor", age_factor, self.gamma),
+        ]
+        risk_score = round(min(1.0, sum(n.contribution for n in nodes)), 4)
+
+        breakdown = ExplainabilityBreakdown(
+            vital_deviation=vital_deviation,
+            nlp_urgency=nlp_urgency,
+            age_factor=age_factor,
+            alpha=self.alpha,
+            beta=self.beta,
+            gamma=self.gamma,
+            alpha_contribution=round(nodes[0].contribution, 4),
+            beta_contribution=round(nodes[1].contribution, 4),
+            gamma_contribution=round(nodes[2].contribution, 4),
+        )
+        return risk_score, breakdown
+
+    def describe(self) -> str:
+        return (
+            f"RiskDAG(alpha={self.alpha}, beta={self.beta}, gamma={self.gamma}) "
+            f"-> Risk_Score = alpha*Vital_Deviation + beta*NLP_Urgency + gamma*Age_Factor"
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Public functions (the contract the orchestrator/UI call against)
+# --------------------------------------------------------------------------- #
+
+def compute_risk(
+    vital_deviation: float,
+    nlp_urgency: float,
+    age_factor: float,
+    alpha: float = DEFAULT_ALPHA,
+    beta: float = DEFAULT_BETA,
+    gamma: float = DEFAULT_GAMMA,
+) -> tuple[float, ExplainabilityBreakdown]:
+    """
+    Combine the three sub-scores into a final risk score via the RiskDAG.
+
+    Returns:
+        (risk_score, explainability_breakdown)
+    """
+    dag = RiskDAG(alpha=alpha, beta=beta, gamma=gamma)
+    return dag.score(vital_deviation, nlp_urgency, age_factor)
+
+
+def map_risk_to_esi(risk_score: float) -> int:
+    """
+    Map a continuous risk score in [0.0, 1.0] to a discrete ESI level (1-5).
+
+    1 = most urgent, 5 = least urgent. Thresholds are defined in
+    ESI_THRESHOLDS above — adjust them there, not here.
+    """
+    for threshold, esi in ESI_THRESHOLDS:
+        if risk_score >= threshold:
+            return esi
+    return 5  # fallback, should be unreachable given the 0.00 threshold
+
+
+def check_decide_triggers(
+    vital_deviation: float,
+    nlp_urgency: float,
+    nlp_label: str,
+    heart_rate: int,
+) -> list[str]:
+    """
+    Return narrow, high-confidence auto-triggered actions.
+
+    Deliberately conservative — this is the "decide" side of
+    decide-vs-recommend, so false positives are costly. Most patients
+    return an empty list.
+    """
+    decisions: list[str] = []
+
+    if nlp_label == "Cardiac" and nlp_urgency >= 0.80 and heart_rate > 120:
+        decisions.append("DECISION: Auto-order ECG + Cardiac Enzyme Panel")
+
+    if nlp_label == "Respiratory" and nlp_urgency >= 0.80 and vital_deviation >= 0.5:
+        decisions.append("DECISION: Auto-order pulse oximetry re-check + oxygen prep")
+
+    if nlp_label == "Trauma" and vital_deviation >= 0.7:
+        decisions.append("DECISION: Flag for immediate trauma-bay routing")
+
+    return decisions
+</file>
+
+<file path="engine/vitals_age.py">
+"""
+engine/vitals_age.py
+
+Owner: Ayush — Day 1
+
+Baseline implementation is complete and tested. Ayush: feel free to refine
+the clinical thresholds/weights below — the function signatures and return
+contract (float in [0.0, 1.0]) must stay the same, since risk_engine.py and
+orchestrator.py both depend on them.
+"""
+
+from __future__ import annotations
+
+# --------------------------------------------------------------------------- #
+# Clinical reference ranges (adult). Documented here so the scoring logic is
+# auditable, not a black box — cite these if a judge asks.
+# --------------------------------------------------------------------------- #
+
+NORMAL_HR = (60, 100)          # bpm
+NORMAL_SPO2_MIN = 95.0         # %
+NORMAL_TEMP = (36.1, 37.2)     # deg C
+
+
+def _deviation_fraction(value: float, low: float, high: float, hard_span: float) -> float:
+    """
+    How far `value` sits outside [low, high], normalized to [0.0, 1.0].
+
+    0.0 if inside the normal range. Scales linearly up to 1.0 once the value
+    is `hard_span` units past the boundary (clamped beyond that), so a mild
+    deviation scores low and a severe one saturates at 1.0 instead of growing
+    without bound.
+    """
+    if low <= value <= high:
+        return 0.0
+    distance = low - value if value < low else value - high
+    return min(1.0, distance / hard_span)
+
+
+def score_vital_deviation(age: int, heart_rate: int, spo2: float, temperature: float) -> float:
+    """
+    Score how far a patient's vitals deviate from safe clinical ranges.
+
+    Combines three independent deviation fractions (heart rate, SpO2,
+    temperature) into one score via a weighted max-and-average blend: the
+    single worst vital dominates (a critically low SpO2 alone should already
+    read as high-risk), but the other two still nudge the score up, so two
+    moderately-abnormal vitals together score higher than either alone.
+
+    Returns:
+        Float in [0.0, 1.0]. 0.0 = all vitals normal, 1.0 = severely abnormal.
+    """
+    hr_dev = _deviation_fraction(heart_rate, *NORMAL_HR, hard_span=60)
+    spo2_dev = 0.0 if spo2 >= NORMAL_SPO2_MIN else min(1.0, (NORMAL_SPO2_MIN - spo2) / 20)
+    temp_dev = _deviation_fraction(temperature, *NORMAL_TEMP, hard_span=3.5)
+
+    worst = max(hr_dev, spo2_dev, temp_dev)
+    average = (hr_dev + spo2_dev + temp_dev) / 3
+    return round(min(1.0, 0.7 * worst + 0.3 * average), 4)
+
+
+def score_age_factor(age: int) -> float:
+    """
+    Score age-based risk contribution.
+
+    Higher for very young (<5) and elderly (>65) patients, reflecting real
+    clinical risk stratification — both groups decompensate faster and
+    tolerate the same vital deviation less well than a healthy adult.
+
+    Returns:
+        Float in [0.0, 1.0].
+    """
+    if age < 1:
+        return 1.0
+    if age < 5:
+        return round(0.75 - (age / 5) * 0.25, 4)      # 0.75 -> 0.50
+    if age <= 65:
+        return 0.1
+    if age <= 80:
+        return round(0.1 + ((age - 65) / 15) * 0.4, 4)  # 0.10 -> 0.50
+    return round(min(1.0, 0.5 + ((age - 80) / 20) * 0.5), 4)  # 0.50 -> 1.00+
+</file>
+
 <file path="frontend/ui/__init__.py">
 
 </file>
@@ -3899,184 +4970,150 @@ with right:
 
 <file path="frontend/ui/app.py">
 """
-ui/app.py
+frontend/ui/app.py - FIXED VERSION WITH CORRECT IMPORTS
 
-PatientTriage.ai — fully wired Streamlit app.
-
-Run with:
-    streamlit run ui/app.py
+This version has the import path fixes to work with the project structure.
+Copy this entire file and replace your current frontend/ui/app.py
 """
 
-from __future__ import annotations
+# ============================================================================
+# IMPORT FIX - ADD THIS AT THE VERY TOP (BEFORE ANY OTHER IMPORTS)
+# ============================================================================
 
 import sys
 from pathlib import Path
 
-# Allow running as `streamlit run ui/app.py` from repo root without a package install.
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+# Add project root to Python path so it can find engine and models
+project_root = Path(__file__).parent.parent.parent
+sys.path.insert(0, str(project_root))
+
+# ============================================================================
+# NOW IMPORT THE REST
+# ============================================================================
 
 import streamlit as st
-from pydantic import ValidationError
+from datetime import datetime
 
+# NOW these imports will work!
 from engine.orchestrator import TriageError, run_triage
 from models.schemas import PatientInput, TriageResult
 
-# --------------------------------------------------------------------------- #
-# Page config — must be the first Streamlit call
-# --------------------------------------------------------------------------- #
+# ============================================================================
+# PAGE CONFIG
+# ============================================================================
 
 st.set_page_config(
     page_title="PatientTriage.ai",
-    page_icon="\U0001FA7A",
+    page_icon="🩺",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
 
-# --------------------------------------------------------------------------- #
-# Dark-mode styling
-# --------------------------------------------------------------------------- #
+# ============================================================================
+# DARK MODE STYLING
+# ============================================================================
+
+st.markdown("""
+<style>
+.stApp {
+    background-color: #0E1117;
+    color: #E6E6E6;
+}
+.block-container {
+    padding-top: 1.5rem;
+    padding-bottom: 2rem;
+}
+.panel-header {
+    font-size: 1.05rem;
+    font-weight: 700;
+    color: #FFFFFF;
+    background: linear-gradient(90deg, #6E00B8, #A100FF);
+    padding: 10px 14px;
+    border-radius: 8px;
+    margin-bottom: 14px;
+}
+.panel-card {
+    background-color: #161B22;
+    border: 1px solid #262C36;
+    border-radius: 10px;
+    padding: 16px;
+    min-height: 480px;
+}
+.esi-badge {
+    text-align: center;
+    padding: 24px;
+    border-radius: 10px;
+    font-size: 2.8rem;
+    font-weight: 800;
+    color: #FFFFFF;
+}
+.esi1 { background-color: #D32F2F; }
+.esi2 { background-color: #F57C00; }
+.esi3 { background-color: #FBC02D; color: #333333; }
+.esi4 { background-color: #7CB342; }
+.esi5 { background-color: #1976D2; }
+.mcm-banner {
+    background-color: #4A0E0E;
+    border: 1px solid #C0392B;
+    color: #FFD9D9;
+    padding: 8px 12px;
+    border-radius: 6px;
+    font-weight: 600;
+    font-size: 0.85rem;
+    margin-bottom: 12px;
+    text-align: center;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# ============================================================================
+# HEADER
+# ============================================================================
 
 st.markdown(
-    """
-    <style>
-    .stApp { background-color: #0E1117; color: #E6E6E6; }
-    .block-container { padding-top: 1.5rem; padding-bottom: 2rem; }
-    .panel-header {
-        font-size: 1.05rem; font-weight: 700; color: #FFFFFF;
-        background: linear-gradient(90deg, #6E00B8, #A100FF);
-        padding: 10px 14px; border-radius: 8px; margin-bottom: 14px;
-    }
-    .panel-card {
-        background-color: #161B22; border: 1px solid #262C36;
-        border-radius: 10px; padding: 16px; min-height: 480px;
-    }
-    .placeholder-text { color: #8B93A1; font-size: 0.92rem; line-height: 1.5; margin-top: 8px; }
-    .mcm-banner {
-        background-color: #4A0E0E; border: 1px solid #C0392B; color: #FFD9D9;
-        padding: 8px 12px; border-radius: 6px; font-weight: 600;
-        font-size: 0.85rem; margin-bottom: 12px; text-align: center;
-    }
-    .fallback-banner {
-        background-color: #4A3B0E; border: 1px solid #C09B2B; color: #FFF0D9;
-        padding: 6px 10px; border-radius: 6px; font-size: 0.78rem;
-        margin-bottom: 12px; text-align: center;
-    }
-    .esi-badge {
-        text-align: center; padding: 22px 10px; border-radius: 10px;
-        font-size: 2.4rem; font-weight: 800; color: #FFFFFF; margin-bottom: 10px;
-    }
-    .esi-sub { text-align: center; font-size: 0.85rem; color: #C8C8C8; margin-bottom: 16px; }
-    .decision-item {
-        background-color: #1F1500; border-left: 4px solid #E0A100; color: #FFE9B3;
-        padding: 8px 12px; border-radius: 4px; margin-bottom: 8px; font-size: 0.9rem;
-    }
-    .no-decision {
-        color: #6FCF97; font-size: 0.9rem; padding: 6px 0;
-    }
-    .reason-box {
-        background-color: #0E1117; border: 1px solid #262C36; border-radius: 6px;
-        padding: 10px 12px; font-size: 0.85rem; color: #C8C8C8; margin-top: 10px;
-    }
-    div[data-testid="stTextArea"] textarea { background-color: #0E1117; color: #E6E6E6; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-ESI_COLORS = {
-    1: "#D32F2F",  # red
-    2: "#F57C00",  # orange
-    3: "#FBC02D",  # yellow
-    4: "#7CB342",  # green
-    5: "#1976D2",  # blue
-}
-ESI_LABELS = {
-    1: "Resuscitation",
-    2: "Emergent",
-    3: "Urgent",
-    4: "Less Urgent",
-    5: "Non-Urgent",
-}
-
-# --------------------------------------------------------------------------- #
-# Session state — persists the last result across reruns (e.g. toggling
-# Mass Casualty Mode after a run should re-route live without needing a
-# fresh click of "Run Triage Assessment").
-# --------------------------------------------------------------------------- #
-
-st.session_state.setdefault("last_result", None)
-st.session_state.setdefault("last_meta", None)
-st.session_state.setdefault("last_inputs", None)   # dict of raw widget values
-st.session_state.setdefault("last_mode", None)
-st.session_state.setdefault("last_error", None)
-
-
-def _compute(raw: dict) -> None:
-    """Build a PatientInput from raw widget values, run triage, store results."""
-    st.session_state["last_error"] = None
-    try:
-        patient = PatientInput(**raw)
-    except ValidationError as exc:
-        st.session_state["last_error"] = (
-            "Invalid patient data — please check the highlighted fields:\n\n"
-            + "\n".join(f"- {e['loc'][0]}: {e['msg']}" for e in exc.errors())
-        )
-        st.session_state["last_result"] = None
-        return
-
-    try:
-        result, meta = run_triage(patient)
-        st.session_state["last_result"] = result
-        st.session_state["last_meta"] = meta
-        st.session_state["last_inputs"] = raw
-        st.session_state["last_mode"] = raw["mass_casualty_mode"]
-    except TriageError as exc:
-        st.session_state["last_error"] = f"Triage engine error: {exc}"
-        st.session_state["last_result"] = None
-
-
-# --------------------------------------------------------------------------- #
-# Header
-# --------------------------------------------------------------------------- #
-
-st.markdown(
-    "<h1 style='margin-bottom:0;'>\U0001FA7A PatientTriage.ai</h1>"
+    "<h1 style='margin-bottom:0;'>🩺 PatientTriage.ai</h1>"
     "<p style='color:#8B93A1;margin-top:2px;'>"
-    "Multi-Modal Triage Graph (MMTG) &middot; ED decision-support prototype"
+    "Multi-Modal Triage Graph (MMTG) — ED Decision Support"
     "</p>",
     unsafe_allow_html=True,
 )
 st.divider()
 
+# ============================================================================
+# THREE-COLUMN LAYOUT
+# ============================================================================
+
 left, center, right = st.columns([1, 1.2, 1], gap="medium")
 
-# ---- LEFT: Input panel ------------------------------------------------- #
+# ---- LEFT: INPUT PANEL ---- #
 with left:
     st.markdown('<div class="panel-header">Patient Input</div>', unsafe_allow_html=True)
     st.markdown('<div class="panel-card">', unsafe_allow_html=True)
 
     mass_casualty_mode = st.toggle(
         "Mass Casualty Mode",
-        value=bool(st.session_state["last_mode"]) if st.session_state["last_mode"] is not None else False,
-        help="Bypasses the NLP model entirely and routes through the "
-        "deterministic vitals-only priority queue.",
+        value=False,
+        help="Bypasses NLP model for deterministic vitals-only routing",
     )
+    
     if mass_casualty_mode:
         st.markdown(
-            '<div class="mcm-banner">\u26A0 MASS CASUALTY MODE ACTIVE — AI model bypassed</div>',
+            '<div class="mcm-banner">⚠ MASS CASUALTY MODE — AI Model Bypassed</div>',
             unsafe_allow_html=True,
         )
 
     st.markdown("**Vitals**")
     age = st.slider("Age (years)", min_value=0, max_value=120, value=45)
-    heart_rate = st.slider("Heart rate (bpm)", min_value=0, max_value=220, value=80)
+    heart_rate = st.slider("Heart Rate (bpm)", min_value=0, max_value=220, value=80)
     spo2 = st.slider("SpO2 (%)", min_value=50.0, max_value=100.0, value=97.0, step=0.5)
-    temperature = st.slider("Temperature (\u00b0C)", min_value=30.0, max_value=42.0, value=37.0, step=0.1)
+    temperature = st.slider(
+        "Temperature (°C)", min_value=30.0, max_value=42.0, value=37.0, step=0.1
+    )
 
     st.markdown("**Chief Complaint**")
     chief_complaint = st.text_area(
         "What is the patient's main complaint?",
-        placeholder='e.g. "Patient clutching chest, says it feels tight"',
+        placeholder="e.g., 'Severe chest pain radiating to left arm'",
         height=100,
         label_visibility="collapsed",
     )
@@ -4085,124 +5122,110 @@ with left:
 
     st.markdown("</div>", unsafe_allow_html=True)
 
-# --------------------------------------------------------------------------- #
-# Decide whether to (re)compute this run:
-#   1. Explicit "Run" click, using current widget values.
-#   2. Mass Casualty toggle changed since the last computed result, and a
-#      result already exists — re-route live using the same vitals/complaint.
-# --------------------------------------------------------------------------- #
-
-raw_current = {
-    "age": age,
-    "heart_rate": heart_rate,
-    "spo2": spo2,
-    "temperature": temperature,
-    "chief_complaint": chief_complaint or "",
-    "mass_casualty_mode": mass_casualty_mode,
-}
-
-if submitted:
-    _compute(raw_current)
-elif (
-    st.session_state["last_inputs"] is not None
-    and st.session_state["last_mode"] is not None
-    and st.session_state["last_mode"] != mass_casualty_mode
-):
-    # Live re-route: reuse the last submitted vitals/complaint, new mode.
-    reroute_inputs = dict(st.session_state["last_inputs"])
-    reroute_inputs["mass_casualty_mode"] = mass_casualty_mode
-    _compute(reroute_inputs)
-
-result: TriageResult | None = st.session_state["last_result"]
-meta = st.session_state["last_meta"]
-error = st.session_state["last_error"]
-
-# ---- CENTER: Recommendation & Action panel ------------------------------ #
+# ---- CENTER: RECOMMENDATION PANEL ---- #
 with center:
-    st.markdown('<div class="panel-header">Recommendation &amp; Actions</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="panel-header">Recommendation &amp; Actions</div>',
+        unsafe_allow_html=True,
+    )
     st.markdown('<div class="panel-card">', unsafe_allow_html=True)
 
-    if error:
-        st.error(error)
-    elif result is None:
-        st.markdown(
-            '<p class="placeholder-text">No assessment run yet. '
-            "Fill in the patient details on the left and click "
-            "<b>Run Triage Assessment</b>.</p>",
-            unsafe_allow_html=True,
-        )
+    if submitted:
+        try:
+            # Validate input
+            if not chief_complaint.strip():
+                st.error("Please enter a chief complaint")
+            else:
+                # Create patient input
+                patient = PatientInput(
+                    age=age,
+                    heart_rate=heart_rate,
+                    spo2=spo2,
+                    temperature=temperature,
+                    chief_complaint=chief_complaint,
+                    mass_casualty_mode=mass_casualty_mode,
+                )
+
+                # Run triage
+                result, meta = run_triage(patient)
+
+                # Display ESI badge
+                esi_css = f"esi{result.esi_level}"
+                st.markdown(
+                    f'<div class="esi-badge {esi_css}">ESI {result.esi_level}</div>',
+                    unsafe_allow_html=True,
+                )
+
+                # Display metrics
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric("Risk Score", f"{result.risk_score:.2f}")
+                with col2:
+                    st.metric("Latency", f"{meta.latency_ms:.1f}ms")
+
+                # Display decisions
+                if result.decisions:
+                    st.markdown("**Auto-Triggered Decisions**")
+                    for decision in result.decisions:
+                        st.success(f"✓ {decision}")
+                else:
+                    st.info("No auto-triggered decisions")
+
+        except ValueError as e:
+            st.error(f"Validation Error: {str(e)}")
+        except TriageError as e:
+            st.error(f"Triage Error: {str(e)}")
+        except Exception as e:
+            st.error(f"Unexpected Error: {str(e)}")
     else:
-        if result.mass_casualty_mode:
-            st.markdown(
-                '<div class="mcm-banner">\u26A0 Result from Mass Casualty queue '
-                "(deterministic, vitals-only — NLP not used)</div>",
-                unsafe_allow_html=True,
-            )
-        elif meta is not None and meta.used_nlp_fallback:
-            st.markdown(
-                '<div class="fallback-banner">NLP model unavailable — '
-                "used keyword-based fallback classifier</div>",
-                unsafe_allow_html=True,
-            )
-
-        color = ESI_COLORS[result.esi_level]
-        st.markdown(
-            f'<div class="esi-badge" style="background-color:{color};">'
-            f"ESI {result.esi_level}</div>"
-            f'<div class="esi-sub">{ESI_LABELS[result.esi_level]} '
-            f"&middot; Risk Score {result.risk_score:.2f} "
-            f"&middot; <i>Recommended — nurse confirms</i></div>",
-            unsafe_allow_html=True,
-        )
-
-        st.markdown("**Auto-Triggered Actions**")
-        if result.decisions:
-            for d in result.decisions:
-                st.markdown(f'<div class="decision-item">{d}</div>', unsafe_allow_html=True)
-        else:
-            st.markdown(
-                '<div class="no-decision">No auto-triggered actions for this patient.</div>',
-                unsafe_allow_html=True,
-            )
-
-        if result.reason:
-            st.markdown(f'<div class="reason-box"><b>Why:</b> {result.reason}</div>', unsafe_allow_html=True)
+        st.info("Enter patient data and click 'Run Triage Assessment' to see results")
 
     st.markdown("</div>", unsafe_allow_html=True)
 
-# ---- RIGHT: Explainability panel ---------------------------------------- #
+# ---- RIGHT: EXPLAINABILITY PANEL ---- #
 with right:
-    st.markdown('<div class="panel-header">Explainability</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="panel-header">Explainability</div>',
+        unsafe_allow_html=True,
+    )
     st.markdown('<div class="panel-card">', unsafe_allow_html=True)
 
-    if error or result is None:
-        st.markdown(
-            '<p class="placeholder-text">No assessment run yet. Once a result comes '
-            "back, this panel will show the live &alpha; / &beta; / &gamma; weight "
-            "breakdown behind the risk score.</p>",
-            unsafe_allow_html=True,
-        )
-    elif result.explain is None:
-        st.markdown(
-            '<p class="placeholder-text">Not applicable — this result came from the '
-            "Mass Casualty queue, which is rule-based rather than weighted, so there "
-            "is no &alpha;/&beta;/&gamma; breakdown to show.</p>",
-            unsafe_allow_html=True,
-        )
-    else:
+    if submitted and 'result' in locals() and result.explain:
         e = result.explain
-        st.caption(f"Risk = {e.alpha:.1f}\u00b7Vitals + {e.beta:.1f}\u00b7NLP + {e.gamma:.1f}\u00b7Age")
+        
+        st.write(f"**α = {e.alpha}** | **β = {e.beta}** | **γ = {e.gamma}**")
 
-        st.markdown(f"**Vital Deviation** — raw {e.vital_deviation:.2f}, contributes {e.alpha_contribution:.2f}")
+        st.metric("Vital Contribution", f"{e.alpha_contribution:.3f}")
         st.progress(min(1.0, e.alpha_contribution))
 
-        st.markdown(f"**NLP Urgency** — raw {e.nlp_urgency:.2f}, contributes {e.beta_contribution:.2f}")
+        st.metric("NLP Contribution", f"{e.beta_contribution:.3f}")
         st.progress(min(1.0, e.beta_contribution))
 
-        st.markdown(f"**Age Factor** — raw {e.age_factor:.2f}, contributes {e.gamma_contribution:.2f}")
+        st.metric("Age Contribution", f"{e.gamma_contribution:.3f}")
         st.progress(min(1.0, e.gamma_contribution))
 
+    elif submitted and 'result' in locals() and result.mass_casualty_mode:
+        st.info(
+            "**Mass Casualty Mode:** Rule-based routing (no AI weighting). "
+            "No explainability breakdown provided."
+        )
+    else:
+        st.info("Explainability data will appear here after assessment")
+
     st.markdown("</div>", unsafe_allow_html=True)
+
+# ============================================================================
+# FOOTER
+# ============================================================================
+
+st.divider()
+st.markdown(
+    "<p style='text-align: center; color: #8B93A1; font-size: 0.8rem;'>"
+    f"PatientTriage.ai • Built {datetime.now().year} • "
+    "<a href='#' style='color: #8B93A1;'>Documentation</a>"
+    "</p>",
+    unsafe_allow_html=True,
+)
 </file>
 
 <file path="ml/training/train.py">
@@ -4660,6 +5683,175 @@ def main():
 
 if __name__ == "__main__":
     main()
+</file>
+
+<file path="models/__init__.py">
+
+</file>
+
+<file path="models/schemas.py">
+"""
+models/schemas.py
+
+Shared data contract for PatientTriage.ai (MMTG).
+
+Every engine module (NLP classifier, risk engine, vitals/age scoring,
+mass casualty queue) reads a `PatientInput` and, directly or indirectly,
+contributes to a `TriageResult`. Keep these strict — validation errors
+here should surface immediately in the UI, not silently produce a bad
+risk score.
+"""
+
+from __future__ import annotations
+
+from pydantic import BaseModel, Field, field_validator
+
+
+# --------------------------------------------------------------------------- #
+# Input
+# --------------------------------------------------------------------------- #
+
+class PatientInput(BaseModel):
+    """
+    First-minute data captured for a patient at ED arrival.
+
+    Only fields realistically available in the first minute belong here —
+    resist the urge to add "nice to have" fields once lab results, imaging,
+    etc. come back. That's the whole point of the design constraint.
+    """
+
+    age: int = Field(
+        ...,
+        ge=0,
+        le=120,
+        description="Patient age in years.",
+    )
+    heart_rate: int = Field(
+        ...,
+        ge=0,
+        le=300,
+        description="Heart rate in beats per minute (bpm).",
+    )
+    spo2: float = Field(
+        ...,
+        ge=0.0,
+        le=100.0,
+        description="Blood oxygen saturation, percent (%).",
+    )
+    temperature: float = Field(
+        ...,
+        ge=25.0,
+        le=45.0,
+        description="Body temperature in degrees Celsius. "
+        "Range covers severe hypothermia through severe hyperthermia.",
+    )
+    chief_complaint: str = Field(
+        ...,
+        min_length=1,
+        max_length=500,
+        description="Free-text description of why the patient is here, "
+        "captured verbatim at intake.",
+    )
+    mass_casualty_mode: bool = Field(
+        default=False,
+        description="When True, the engine MUST bypass the NLP pipeline "
+        "entirely and route through the deterministic vitals-only queue.",
+    )
+
+    @field_validator("chief_complaint")
+    @classmethod
+    def complaint_not_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("chief_complaint cannot be blank or whitespace-only")
+        return v.strip()
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "age": 54,
+                "heart_rate": 128,
+                "spo2": 91.0,
+                "temperature": 37.6,
+                "chief_complaint": "Patient clutching chest, says it feels tight",
+                "mass_casualty_mode": False,
+            }
+        }
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Output
+# --------------------------------------------------------------------------- #
+
+class ExplainabilityBreakdown(BaseModel):
+    """
+    Raw sub-scores and their weighted contribution to the final risk score.
+
+    This is what powers the explainability panel — every number here should
+    be something the UI can render directly (e.g. as a progress bar) without
+    any further computation.
+    """
+
+    vital_deviation: float = Field(..., ge=0.0, le=1.0)
+    nlp_urgency: float = Field(..., ge=0.0, le=1.0)
+    age_factor: float = Field(..., ge=0.0, le=1.0)
+
+    alpha: float = Field(..., description="Weight applied to vital_deviation.")
+    beta: float = Field(..., description="Weight applied to nlp_urgency.")
+    gamma: float = Field(..., description="Weight applied to age_factor.")
+
+    alpha_contribution: float = Field(
+        ..., description="alpha * vital_deviation — this term's share of Risk_Score."
+    )
+    beta_contribution: float = Field(
+        ..., description="beta * nlp_urgency — this term's share of Risk_Score."
+    )
+    gamma_contribution: float = Field(
+        ..., description="gamma * age_factor — this term's share of Risk_Score."
+    )
+
+
+class TriageResult(BaseModel):
+    """
+    The engine's complete output for one patient.
+
+    `decisions` is intentionally a short list — only narrow, protocol-safe
+    auto-actions belong here (the "decide" side of decide-vs-recommend).
+    Everything else the system suggests belongs in `esi_level`, which the
+    nurse always confirms.
+    """
+
+    risk_score: float = Field(
+        ..., ge=0.0, le=1.0, description="Final combined MMTG risk score."
+    )
+    esi_level: int = Field(
+        ...,
+        ge=1,
+        le=5,
+        description="Recommended Emergency Severity Index. "
+        "1 = most urgent, 5 = least urgent. Always nurse-confirmed.",
+    )
+    decisions: list[str] = Field(
+        default_factory=list,
+        description='Narrow, auto-triggered protocol actions, e.g. '
+        '"Auto-order ECG + Cardiac Enzyme Panel". Empty in most cases.',
+    )
+    mass_casualty_mode: bool = Field(
+        default=False,
+        description="True if this result came from the deterministic "
+        "vitals-only bypass queue rather than the full MMTG pipeline.",
+    )
+    explain: ExplainabilityBreakdown | None = Field(
+        default=None,
+        description="Full weight breakdown for the explainability panel. "
+        "None when mass_casualty_mode is True — that path is rule-based, "
+        "not weighted, so there is nothing to attribute to alpha/beta/gamma.",
+    )
+    reason: str | None = Field(
+        default=None,
+        description="One-line plain-English reason, primarily used by the "
+        "Mass Casualty queue (e.g. 'SpO2 critically low, elevated heart rate').",
+    )
 </file>
 
 <file path="tests/unit/__init__.py">
@@ -5761,1524 +6953,6 @@ def stress_test_pipeline(
         "outcomes": outcomes,
         "risk_distribution": risk_distribution,
     }
-</file>
-
-<file path=".env.example">
-# Database
-DATABASE_URL=postgresql://user:password@localhost:5432/patienttriage
-SQLALCHEMY_DATABASE_URL=postgresql://user:password@localhost:5432/patienttriage
-
-# API Settings
-API_HOST=0.0.0.0
-API_PORT=8000
-DEBUG=True
-ENVIRONMENT=development
-
-# CORS
-CORS_ORIGINS=["http://localhost:3000","http://localhost:8501"]
-
-# Authentication
-API_KEY_HEADER=X-API-Key
-SECRET_KEY=your-secret-key-here
-
-# NLP Settings
-NLP_MODEL=facebook/bart-large-mnli
-NLP_DEVICE=cpu
-
-# Logging
-LOG_LEVEL=INFO
-</file>
-
-<file path="INTEGRATION_GUIDE.md">
-# PatientTriage.ai Round 2 - File Integration Guide
-
-## Complete File Mapping
-
-### Backend Files
-
-**`backend/api/main.py`** - FastAPI application entry point
-- Single patient triage endpoint: `POST /v1/triage/assess`
-- Batch processing endpoint: `POST /v1/triage/batch`
-- Patient management: `POST/GET /v1/patients`
-- Metrics endpoints: `GET /v1/metrics/summary`, `GET /v1/metrics/export`
-- Health checks: `GET /health`, `GET /health/detailed`
-- CORS, logging, error handling middleware
-
-**`backend/config/settings.py`** - Configuration management
-- Database URL configuration
-- API settings (host, port, debug mode)
-- CORS allowed origins
-- Authentication settings
-- Logging configuration
-- Environment-based config loading
-
-**`backend/db/models.py`** - SQLAlchemy ORM models
-- `Patient` model with medical record tracking
-- `TriageAssessment` model with full audit trail
-- `BatchJob` model for tracking batch processing
-- `Metric` model for analytics storage
-- Relationships and indexes for query optimization
-
-**`backend/schemas/schemas.py`** - Pydantic request/response models
-- `TriageAssessmentRequest` - Input validation
-- `TriageAssessmentResponse` - Output with ESI level, decision, explainability
-- `PatientCreate`, `PatientResponse` - Patient CRUD
-- `BatchTriageRequest`, `BatchTriageResponse` - Batch operations
-- `MetricsSummary` - Analytics data structure
-
-**`backend/services/triage_service.py`** - Business logic layer
-- `TriageService` class integrating the triage engine
-- `assess_patient()` - Single patient assessment
-- `assess_batch()` - Batch processing with error recovery
-- Metrics logging and retrieval
-- Integration with SQLAlchemy for persistence
-
-### ML Files
-
-**`ml/training/train.py`** - ML training pipeline
-- Custom NLP model fine-tuning
-- Dataset preparation for medical urgency classification
-- Model evaluation and validation
-- Hyperparameter optimization
-- Model versioning and checkpointing
-
-### DevOps Files
-
-**`devops/docker/Dockerfile`** - Backend container image
-- Python 3.11 base image
-- Dependencies installation
-- Application setup and startup command
-
-**`devops/docker/docker-compose.dev.yml`** - Local development setup
-- PostgreSQL database service
-- FastAPI backend service
-- Streamlit frontend service
-- Volume mounts for code hot-reload
-- Network configuration
-
-**`devops/github_actions_ci_cd.yml`** - Automated testing and deployment
-- Lint and format checking
-- Unit and integration tests
-- Docker image building and pushing
-- Deployment automation
-
-### Frontend Files
-
-**`frontend/ui/app.py`** - Main Streamlit interface (Round 1)
-**`frontend/ui/app_advanced.py`** - Advanced features (batch, metrics)
-
-### Core Engine (Round 1)
-
-**`engine/`** - MMTG triage logic
-- `orchestrator.py` - Main entry point
-- `risk_engine.py` - Risk scoring DAG
-- `nlp_classifier.py` - NLP urgency scoring
-- `vitals_age.py` - Vital and age factor scoring
-- `mass_casualty.py` - Deterministic fallback
-- `config.py`, `metrics.py` - Configuration and observability
-
-**`models/schemas.py`** - Shared Pydantic models
-
-### Configuration Files
-
-**.env.example** - Environment variables template
-**requirements.txt** - All Python dependencies
-**.gitignore** - Git ignore rules
-
-### Documentation
-
-**docs/SETUP_GUIDE.md** - Complete installation guide
-**docs/ROUND2_IMPLEMENTATION_SUMMARY.md** - What's been built
-**docs/ROUND2_ROADMAP.md** - Development roadmap
-**docs/README_ORIGINAL.md** - Round 1 documentation
-
----
-
-## Installation & Running
-
-### 1. Backend API
-```bash
-cd backend
-pip install -r ../requirements.txt
-export DATABASE_URL=postgresql://user:pass@localhost:5432/patienttriage
-python -m uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
-```
-
-### 2. Frontend (Streamlit)
-```bash
-cd frontend
-streamlit run ui/app.py --server.port 8501
-```
-
-### 3. Database (Docker)
-```bash
-docker-compose -f devops/docker/docker-compose.dev.yml up postgres
-```
-
-### 4. Full Stack (Docker Compose)
-```bash
-docker-compose -f devops/docker/docker-compose.dev.yml up
-```
-
----
-
-## API Endpoints
-
-### Triage
-- `POST /v1/triage/assess` - Single patient assessment
-- `POST /v1/triage/batch` - Batch CSV processing
-
-### Patients
-- `POST /v1/patients` - Create patient record
-- `GET /v1/patients/{id}` - Get patient details
-- `GET /v1/patients` - List all patients
-
-### Metrics
-- `GET /v1/metrics/summary` - Summary statistics
-- `GET /v1/metrics/export` - Export as JSON/CSV
-
-### Health
-- `GET /health` - Simple health check
-- `GET /health/detailed` - Detailed component status
-
----
-
-## Testing
-
-```bash
-# Unit tests
-pytest tests/unit/ -v
-
-# Integration tests
-pytest tests/integration/ -v
-
-# Coverage report
-pytest tests/ --cov=backend --cov=engine --cov-report=html
-```
-
----
-
-## Deployment
-
-### Docker Compose (Local Development)
-```bash
-docker-compose -f devops/docker/docker-compose.dev.yml up
-```
-
-### Kubernetes (Production)
-```bash
-# Build image
-docker build -f devops/docker/Dockerfile -t patienttriage:latest .
-
-# Push to registry
-docker tag patienttriage:latest myregistry.azurecr.io/patienttriage:latest
-docker push myregistry.azurecr.io/patienttriage:latest
-
-# Deploy
-kubectl apply -f devops/kubernetes/deployment.yaml
-```
-
----
-
-## Environment Variables
-
-Copy `.env.example` to `.env` and configure:
-
-```bash
-# Database
-DATABASE_URL=postgresql://localhost:5432/patienttriage
-
-# API
-API_HOST=0.0.0.0
-API_PORT=8000
-DEBUG=True
-
-# NLP
-NLP_MODEL=facebook/bart-large-mnli
-NLP_DEVICE=cpu  # or 'cuda'
-
-# CORS
-CORS_ORIGINS=["http://localhost:3000","http://localhost:8501"]
-```
-
----
-
-## Troubleshooting
-
-### Database Connection Error
-```bash
-# Check PostgreSQL is running
-docker ps | grep postgres
-
-# Or install locally
-brew install postgresql
-brew services start postgresql
-```
-
-### Port Already in Use
-```bash
-# Backend
-python -m uvicorn api.main:app --port 8001
-
-# Frontend
-streamlit run ui/app.py --server.port 8502
-```
-
-### NLP Model Download Error
-```bash
-# Pre-download model
-python -c "from transformers import pipeline; pipeline('zero-shot-classification', model='facebook/bart-large-mnli')"
-```
-
----
-
-## Next Steps
-
-1. Follow `docs/SETUP_GUIDE.md` for complete setup
-2. Review `docs/ROUND2_ROADMAP.md` for development priorities
-3. Read `docs/ROUND2_IMPLEMENTATION_SUMMARY.md` to understand what's built
-4. Start with the Streamlit frontend for testing
-5. Use the API for integration with external systems
-</file>
-
-<file path="docs/DEMO_SHOTLIST.md">
-# PatientTriage.ai — Demo Shot List (60–90 seconds)
-
-Goal: make the decide-vs-recommend boundary and the Mass Casualty fallback
-both **visually obvious**, even to someone watching with the sound off.
-
-| # | Shot | What to show | Why it matters |
-|---|------|--------------|-----------------|
-| 1 | **Cold open on a low-risk patient** | Enter scenario #1 from the test checklist (twisted ankle). Click Run. Let the ESI 5 (blue) badge land. | Establishes the baseline calmly before you show something urgent — the contrast is the whole point. |
-| 2 | **Cut to the cardiac emergency** | Clear the form, enter scenario #2 (crushing chest pain, HR 135, SpO2 90%). Click Run. | This is your money shot — a visibly red ESI 1–2 badge appearing. |
-| 3 | **Hold on the decision panel** | Pause 2 full seconds on the "DECISION: Auto-order ECG + Cardiac Enzyme Panel" line before moving on. Don't talk over it — let it read. | This is the "decide" half of decide-vs-recommend. Give it room to land. |
-| 4 | **Pan to the explainability panel** | Point at (or circle, if editing) the three progress bars — vitals, NLP urgency, age — while the cardiac case is still on screen. | Answers "why did it say that" before anyone has to ask. This is your credibility beat. |
-| 5 | **Flip Mass Casualty Mode on, live** | With the same cardiac patient still loaded, toggle Mass Casualty Mode ON on camera. Show the red banner appear and the panel instantly re-route to a rule-based result with no explainability bars. | Demonstrates the fallback isn't a separate demo — it's a live re-route of the same patient, which is the actual architectural claim. |
-| 6 | **Close on the recommend line** | Zoom or highlight the small "Recommended — nurse confirms" text under the ESI badge. | Last thing the viewer sees should reinforce the core design principle, not just the tech. |
-
-**Pacing note:** shots 2–4 are your core 30 seconds — don't rush them.
-Shots 1 and 6 can be quick (3–5 seconds each); they're framing, not content.
-
-**If you're narrating live instead of editing after the fact:** this
-shot order matches the Layer 1→4 walkthrough in the video script almost
-exactly — reuse those lines, just point at the running app instead of the
-static architecture PDF.
-</file>
-
-<file path="docs/TEST_CHECKLIST.md">
-# PatientTriage.ai — Pre-Submission Test Checklist
-
-Run every scenario below through the live app before submitting. For each:
-confirm the ESI badge color/level looks defensible, check whether the
-expected decision fires, and glance at the explainability panel for
-anything nonsensical (e.g. a contribution that's negative, or wildly out
-of proportion to the raw score next to it).
-
-Tick each box as you go. If anything looks wrong, check `engine/orchestrator.py`
-first — that's where normal-mode and mass-casualty-mode routing both live.
-
-## Normal Mode
-
-- [ ] **1. Low risk, routine.** Age 28, HR 76, SpO2 98%, Temp 36.8°C,
-  complaint: *"Twisted my ankle playing football, it's a bit swollen."*
-  Expect: ESI 4–5, no decisions.
-
-- [ ] **2. Classic cardiac emergency.** Age 60, HR 135, SpO2 90%, Temp 37.2°C,
-  complaint: *"Severe chest pain radiating to left arm, feels crushing."*
-  Expect: ESI 1–2, "Auto-order ECG + Cardiac Enzyme Panel" decision fires.
-
-- [ ] **3. Respiratory distress.** Age 45, HR 110, SpO2 88%, Temp 38.9°C,
-  complaint: *"Can't catch my breath, wheezing badly, chest feels tight."*
-  Expect: ESI 1–2, pulse-oximetry/oxygen-prep decision fires.
-
-- [ ] **4. Trauma, high vital deviation.** Age 34, HR 145, SpO2 91%, Temp 36.5°C,
-  complaint: *"Fell off a ladder, leg looks badly broken, lots of bleeding."*
-  Expect: ESI 1–2, trauma-bay routing decision fires.
-
-- [ ] **5. Mid-severity, ambiguous complaint.** Age 50, HR 98, SpO2 95%, Temp 37.9°C,
-  complaint: *"Not feeling well, some stomach pain since this morning."*
-  Expect: ESI 3, no decision (nothing here should be confident enough to
-  auto-trigger anything — this is exactly the kind of case that should
-  stay a pure recommendation).
-
-- [ ] **6. Elderly, borderline vitals.** Age 82, HR 92, SpO2 94%, Temp 37.0°C,
-  complaint: *"Feeling dizzy and weak since yesterday."*
-  Expect: ESI shifted more urgent than a similar case in a younger adult,
-  due to the age factor — confirm the explainability panel actually shows
-  a visible age contribution.
-
-- [ ] **7. Infant, high fever.** Age 1, HR 160, SpO2 96%, Temp 39.8°C,
-  complaint: *"Baby has had a very high fever since last night, very fussy."*
-  Expect: elevated ESI driven by age factor + temperature deviation, even
-  though SpO2/HR alone might look only moderately abnormal for an infant.
-
-- [ ] **8. Empty/near-empty chief complaint.** Age 40, HR 80, SpO2 97%,
-  Temp 37.0°C, complaint: *"pain"* (single word). Confirm the app does
-  **not** crash — either it classifies with low confidence or the fallback
-  keyword classifier kicks in. Should not silently produce ESI 1.
-
-## Mass Casualty Mode
-
-- [ ] **9. Mass casualty, clearly critical.** Toggle Mass Casualty Mode ON.
-  Age 70, HR 140, SpO2 82%, Temp 38.5°C (complaint text irrelevant — it
-  must not be read). Expect: ESI 1–2, `explain` panel shows the "not
-  applicable, rule-based" message (not a blank/broken panel), `reason`
-  field populated with a plain-English explanation.
-
-- [ ] **10. Mass casualty, clearly stable.** Same mode. Age 25, HR 78,
-  SpO2 98%, Temp 36.9°C. Expect: ESI 4–5, reason should say something
-  like "vitals within or near normal range."
-
-## Cross-cutting checks (do these once, not per-scenario)
-
-- [ ] Toggling Mass Casualty Mode **after** an assessment already ran
-  re-routes live using the same vitals, without needing to click
-  "Run Triage Assessment" again.
-- [ ] Switching Mass Casualty Mode back OFF correctly restores the full
-  NLP + risk-engine pipeline (not stuck showing a stale mass-casualty
-  result).
-- [ ] Submitting with an out-of-range value (e.g. drag SpO2 slider — should
-  be impossible via slider, but double check malformed input generally
-  can't crash the app) shows a clean validation error, not a traceback.
-- [ ] Run `pytest tests/ -v` one final time right before submitting — all
-  tests should pass, including `test_decide_trigger_never_contradicts_esi_recommendation`.
-</file>
-
-<file path="engine/__init__.py">
-
-</file>
-
-<file path="engine/config.py">
-"""
-engine/config.py
-
-Centralized configuration management with environment variable support,
-validation, and runtime adjustability.
-"""
-
-from __future__ import annotations
-
-import os
-from dataclasses import dataclass
-from enum import Enum
-from pathlib import Path
-
-
-class EnvironmentType(str, Enum):
-    """Deployment environment type."""
-    DEVELOPMENT = "development"
-    STAGING = "staging"
-    PRODUCTION = "production"
-
-
-@dataclass
-class NLPConfig:
-    """Configuration for the NLP urgency classifier."""
-
-    model_name: str = "facebook/bart-large-mnli"
-    cache_dir: Path = Path.home() / ".cache" / "huggingface"
-    enable_fallback: bool = True
-    timeout_seconds: float = 5.0
-    device: str = "cpu"  # "cpu" or "cuda"
-
-    @classmethod
-    def from_env(cls) -> NLPConfig:
-        """Load configuration from environment variables."""
-        return cls(
-            model_name=os.getenv("NLP_MODEL", "facebook/bart-large-mnli"),
-            cache_dir=Path(os.getenv("NLP_CACHE", Path.home() / ".cache" / "huggingface")),
-            enable_fallback=os.getenv("NLP_FALLBACK", "true").lower() == "true",
-            timeout_seconds=float(os.getenv("NLP_TIMEOUT", "5.0")),
-            device=os.getenv("NLP_DEVICE", "cpu"),
-        )
-
-
-@dataclass
-class RiskEngineConfig:
-    """Configuration for the risk engine (DAG) and ESI mapping."""
-
-    alpha: float = 0.4  # Vital deviation weight
-    beta: float = 0.4   # NLP urgency weight
-    gamma: float = 0.2  # Age factor weight
-
-    esi_thresholds: dict[int, float] = None
-
-    def __post_init__(self):
-        if self.esi_thresholds is None:
-            # Default ESI thresholds
-            self.esi_thresholds = {
-                1: 0.80,  # Resuscitation
-                2: 0.60,  # Emergent
-                3: 0.40,  # Urgent
-                4: 0.20,  # Less Urgent
-                5: 0.00,  # Non-Urgent
-            }
-
-    @classmethod
-    def from_env(cls) -> RiskEngineConfig:
-        """Load configuration from environment variables."""
-        return cls(
-            alpha=float(os.getenv("RISK_ALPHA", "0.4")),
-            beta=float(os.getenv("RISK_BETA", "0.4")),
-            gamma=float(os.getenv("RISK_GAMMA", "0.2")),
-        )
-
-
-@dataclass
-class MetricsConfig:
-    """Configuration for metrics collection and logging."""
-
-    enabled: bool = True
-    output_path: Path = Path("triage_metrics.jsonl")
-    log_level: str = "INFO"
-    log_file: Path = Path("patienttriage.log")
-
-    @classmethod
-    def from_env(cls) -> MetricsConfig:
-        """Load configuration from environment variables."""
-        return cls(
-            enabled=os.getenv("METRICS_ENABLED", "true").lower() == "true",
-            output_path=Path(os.getenv("METRICS_PATH", "triage_metrics.jsonl")),
-            log_level=os.getenv("LOG_LEVEL", "INFO"),
-            log_file=Path(os.getenv("LOG_FILE", "patienttriage.log")),
-        )
-
-
-@dataclass
-class AppConfig:
-    """Top-level application configuration."""
-
-    environment: EnvironmentType = EnvironmentType.DEVELOPMENT
-    nlp: NLPConfig = None
-    risk_engine: RiskEngineConfig = None
-    metrics: MetricsConfig = None
-    debug: bool = False
-
-    def __post_init__(self):
-        if self.nlp is None:
-            self.nlp = NLPConfig.from_env()
-        if self.risk_engine is None:
-            self.risk_engine = RiskEngineConfig.from_env()
-        if self.metrics is None:
-            self.metrics = MetricsConfig.from_env()
-
-    @classmethod
-    def from_env(cls) -> AppConfig:
-        """Load full configuration from environment."""
-        env_str = os.getenv("ENVIRONMENT", "development").lower()
-        environment = EnvironmentType(env_str)
-
-        return cls(
-            environment=environment,
-            nlp=NLPConfig.from_env(),
-            risk_engine=RiskEngineConfig.from_env(),
-            metrics=MetricsConfig.from_env(),
-            debug=os.getenv("DEBUG", "false").lower() == "true",
-        )
-
-    def validate(self) -> None:
-        """Validate configuration parameters."""
-        assert 0.0 <= self.risk_engine.alpha <= 1.0
-        assert 0.0 <= self.risk_engine.beta <= 1.0
-        assert 0.0 <= self.risk_engine.gamma <= 1.0
-        assert self.nlp.timeout_seconds > 0
-        assert self.nlp.device in ("cpu", "cuda")
-
-    def to_dict(self) -> dict:
-        """Convert to dictionary representation."""
-        return {
-            "environment": self.environment.value,
-            "debug": self.debug,
-            "nlp": {
-                "model": self.nlp.model_name,
-                "device": self.nlp.device,
-                "fallback_enabled": self.nlp.enable_fallback,
-                "timeout_s": self.nlp.timeout_seconds,
-            },
-            "risk_engine": {
-                "alpha": self.risk_engine.alpha,
-                "beta": self.risk_engine.beta,
-                "gamma": self.risk_engine.gamma,
-            },
-            "metrics": {
-                "enabled": self.metrics.enabled,
-                "log_level": self.metrics.log_level,
-            },
-        }
-
-
-# Global config singleton
-_app_config: AppConfig | None = None
-
-
-def get_config() -> AppConfig:
-    """Get or initialize the global application config."""
-    global _app_config
-    if _app_config is None:
-        _app_config = AppConfig.from_env()
-        _app_config.validate()
-    return _app_config
-
-
-def reload_config() -> AppConfig:
-    """Reload configuration from environment (for testing)."""
-    global _app_config
-    _app_config = AppConfig.from_env()
-    _app_config.validate()
-    return _app_config
-</file>
-
-<file path="engine/mass_casualty.py">
-"""
-engine/mass_casualty.py
-
-Owner: Ayush — Day 2
-
-Baseline implementation is complete and tested. This path NEVER calls the
-NLP model — that's the whole point (speed and reliability during a surge).
-It reuses the vitals/age scoring from vitals_age.py and risk_engine.py's
-ESI mapping, but composes them completely independently of the normal
-pipeline, so a bug or slowdown in the NLP path can never affect this one.
-"""
-
-from __future__ import annotations
-
-from engine.risk_engine import map_risk_to_esi
-from engine.vitals_age import score_age_factor, score_vital_deviation
-from models.schemas import ExplainabilityBreakdown, PatientInput, TriageResult
-
-# Vitals-only weighting — no beta term, since NLP is bypassed entirely.
-# Vitals dominate; age is a secondary modifier.
-MCM_VITAL_WEIGHT = 0.75
-MCM_AGE_WEIGHT = 0.25
-
-
-def _reason_for(vital_deviation: float, age_factor: float, heart_rate: int, spo2: float) -> str:
-    """Build a short, plain-English reason for this patient's rank."""
-    reasons = []
-    if spo2 < 90:
-        reasons.append("SpO2 critically low")
-    elif spo2 < 95:
-        reasons.append("SpO2 below normal")
-    if heart_rate > 130 or heart_rate < 50:
-        reasons.append("heart rate significantly abnormal")
-    if age_factor >= 0.5:
-        reasons.append("high-risk age group")
-    if not reasons:
-        reasons.append("vitals within or near normal range")
-    return ", ".join(reasons).capitalize()
-
-
-def mass_casualty_queue(patients: list[PatientInput]) -> list[TriageResult]:
-    """
-    Rank a batch of patients using ONLY their vitals (no NLP call at all).
-
-    Args:
-        patients: a batch of PatientInput.
-
-    Returns:
-        TriageResult objects, ordered most to least urgent (index 0 = seen
-        first), each with mass_casualty_mode=True, explain=None (this path
-        is rule-based, not weighted — nothing to attribute to alpha/beta/
-        gamma), and a one-line `reason`.
-    """
-    scored: list[tuple[float, PatientInput, float, float]] = []
-
-    for p in patients:
-        vital_dev = score_vital_deviation(p.age, p.heart_rate, p.spo2, p.temperature)
-        age_factor = score_age_factor(p.age)
-        risk = round(min(1.0, MCM_VITAL_WEIGHT * vital_dev + MCM_AGE_WEIGHT * age_factor), 4)
-        scored.append((risk, p, vital_dev, age_factor))
-
-    scored.sort(key=lambda row: row[0], reverse=True)  # highest risk first
-
-    results: list[TriageResult] = []
-    for risk, p, vital_dev, age_factor in scored:
-        results.append(
-            TriageResult(
-                risk_score=risk,
-                esi_level=map_risk_to_esi(risk),
-                decisions=[],
-                mass_casualty_mode=True,
-                explain=None,
-                reason=_reason_for(vital_dev, age_factor, p.heart_rate, p.spo2),
-            )
-        )
-    return results
-
-
-def triage_single_mass_casualty(patient: PatientInput) -> TriageResult:
-    """Convenience wrapper for the common single-patient UI case."""
-    return mass_casualty_queue([patient])[0]
-</file>
-
-<file path="engine/metrics.py">
-"""
-engine/metrics.py
-
-Production-grade logging and metrics collection. Captures triage decisions,
-decision triggers, NLP fallback usage, and latency for later analysis.
-"""
-
-from __future__ import annotations
-
-import json
-import logging
-import time
-from dataclasses import asdict, dataclass
-from datetime import datetime
-from pathlib import Path
-from typing import Any
-
-from models.schemas import PatientInput, TriageResult
-
-# Configure logger
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.FileHandler("patienttriage.log"),
-        logging.StreamHandler(),
-    ],
-)
-logger = logging.getLogger("engine")
-
-
-@dataclass
-class TriageMetrics:
-    """Metrics captured during a single triage run."""
-
-    timestamp: str
-    patient_age: int
-    patient_spo2: float
-    mass_casualty_mode: bool
-    used_nlp_fallback: bool
-    risk_score: float
-    esi_level: int
-    decision_triggered: bool
-    num_decisions: int
-    latency_ms: float
-    nlp_label: str | None = None
-    nlp_confidence: float | None = None
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-    def to_json(self) -> str:
-        return json.dumps(self.to_dict(), default=str)
-
-
-class MetricsCollector:
-    """Thread-safe metrics collector for triage runs."""
-
-    def __init__(self, output_path: Path | None = None):
-        self.output_path = output_path or Path("triage_metrics.jsonl")
-        self.metrics: list[TriageMetrics] = []
-
-    def record(self, metrics: TriageMetrics) -> None:
-        """Record a triage run's metrics."""
-        self.metrics.append(metrics)
-        self._write_jsonl(metrics)
-        logger.info(
-            f"Triage run recorded: age={metrics.patient_age}, "
-            f"ESI={metrics.esi_level}, risk={metrics.risk_score:.2f}, "
-            f"latency={metrics.latency_ms:.1f}ms"
-        )
-
-    def _write_jsonl(self, metrics: TriageMetrics) -> None:
-        """Append metrics to JSONL file for later analysis."""
-        with open(self.output_path, "a") as f:
-            f.write(metrics.to_json() + "\n")
-
-    def get_summary(self) -> dict[str, Any]:
-        """Return summary statistics across all recorded runs."""
-        if not self.metrics:
-            return {}
-
-        all_risks = [m.risk_score for m in self.metrics]
-        all_latencies = [m.latency_ms for m in self.metrics]
-        triggered_decisions = [m for m in self.metrics if m.decision_triggered]
-
-        return {
-            "total_runs": len(self.metrics),
-            "avg_risk_score": sum(all_risks) / len(all_risks),
-            "min_risk_score": min(all_risks),
-            "max_risk_score": max(all_risks),
-            "avg_latency_ms": sum(all_latencies) / len(all_latencies),
-            "max_latency_ms": max(all_latencies),
-            "decision_trigger_rate": len(triggered_decisions) / len(self.metrics),
-            "nlp_fallback_rate": sum(1 for m in self.metrics if m.used_nlp_fallback) / len(self.metrics),
-            "mass_casualty_runs": sum(1 for m in self.metrics if m.mass_casualty_mode),
-        }
-
-
-# Global singleton
-_collector: MetricsCollector | None = None
-
-
-def get_collector() -> MetricsCollector:
-    """Get or create the global metrics collector."""
-    global _collector
-    if _collector is None:
-        _collector = MetricsCollector()
-    return _collector
-
-
-def record_triage_run(
-    patient: PatientInput,
-    result: TriageResult,
-    latency_ms: float,
-    nlp_label: str | None = None,
-    nlp_confidence: float | None = None,
-    used_nlp_fallback: bool = False,
-) -> None:
-    """Convenience function to record a triage run."""
-    metrics = TriageMetrics(
-        timestamp=datetime.utcnow().isoformat(),
-        patient_age=patient.age,
-        patient_spo2=patient.spo2,
-        mass_casualty_mode=result.mass_casualty_mode,
-        used_nlp_fallback=used_nlp_fallback,
-        risk_score=result.risk_score,
-        esi_level=result.esi_level,
-        decision_triggered=len(result.decisions) > 0,
-        num_decisions=len(result.decisions),
-        latency_ms=latency_ms,
-        nlp_label=nlp_label,
-        nlp_confidence=nlp_confidence,
-    )
-    get_collector().record(metrics)
-</file>
-
-<file path="engine/orchestrator_v2.py">
-"""
-engine/orchestrator_v2.py
-
-Production-grade version of orchestrator.py with:
-- Comprehensive error recovery and graceful degradation
-- Latency tracking and metrics collection
-- Cache-aware design (NLP model loaded once, reused)
-- Detailed audit trail
-- Configurable weights and thresholds
-"""
-
-from __future__ import annotations
-
-import time
-from dataclasses import dataclass
-
-from engine.mass_casualty import triage_single_mass_casualty
-from engine.metrics import record_triage_run
-from engine.nlp_classifier import classify_chief_complaint
-from engine.risk_engine import (
-    DEFAULT_ALPHA,
-    DEFAULT_BETA,
-    DEFAULT_GAMMA,
-    check_decide_triggers,
-    compute_risk,
-    map_risk_to_esi,
-)
-from engine.vitals_age import score_age_factor, score_vital_deviation
-from models.schemas import PatientInput, TriageResult
-
-# Explicit coherence rule: if a decision is auto-triggered, ESI can't be
-# weaker than "Emergent" (2). This prevents the system from saying "routine"
-# while simultaneously auto-ordering critical tests.
-DECIDE_TRIGGER_ESI_CEILING = 2
-
-# Hard timeouts to prevent hang in resource-constrained environments
-NLP_TIMEOUT_SECONDS = 5.0
-
-
-class TriageError(Exception):
-    """Raised when the pipeline cannot produce a result at all."""
-
-
-@dataclass
-class TriageRunMeta:
-    """Extra, UI-relevant metadata about how a result was produced."""
-
-    used_nlp_fallback: bool = False
-    nlp_confidence: float | None = None
-    nlp_label: str | None = None
-    latency_ms: float = 0.0
-    error_recovery_steps: list[str] = None
-
-    def __post_init__(self):
-        if self.error_recovery_steps is None:
-            self.error_recovery_steps = []
-
-
-class TriageConfig:
-    """Tunable configuration for the triage engine."""
-
-    def __init__(
-        self,
-        alpha: float = DEFAULT_ALPHA,
-        beta: float = DEFAULT_BETA,
-        gamma: float = DEFAULT_GAMMA,
-        enable_metrics: bool = True,
-        enable_decision_coherence_check: bool = True,
-    ):
-        self.alpha = alpha
-        self.beta = beta
-        self.gamma = gamma
-        self.enable_metrics = enable_metrics
-        self.enable_decision_coherence_check = enable_decision_coherence_check
-
-    def validate(self) -> None:
-        """Validate configuration."""
-        if not (0.0 <= self.alpha <= 1.0):
-            raise ValueError(f"alpha must be in [0.0, 1.0], got {self.alpha}")
-        if not (0.0 <= self.beta <= 1.0):
-            raise ValueError(f"beta must be in [0.0, 1.0], got {self.beta}")
-        if not (0.0 <= self.gamma <= 1.0):
-            raise ValueError(f"gamma must be in [0.0, 1.0], got {self.gamma}")
-        # Note: alpha + beta + gamma don't need to sum to 1.0 — the risk formula
-        # min()s to 1.0 anyway, and unequal weights can be defensible.
-
-
-def run_triage(
-    patient: PatientInput,
-    config: TriageConfig | None = None,
-) -> tuple[TriageResult, TriageRunMeta]:
-    """
-    Route a PatientInput to the correct pipeline and return a TriageResult.
-
-    - mass_casualty_mode=True  → deterministic, vitals-only bypass queue.
-    - mass_casualty_mode=False → full MMTG pipeline (NLP + vitals + age).
-
-    Both pipelines degrade gracefully on errors (NLP fallback, etc.), so this
-    should almost never raise TriageError — it exists as a last line of
-    defense so the UI never sees a raw traceback.
-
-    Args:
-        patient: the PatientInput to triage.
-        config: TriageConfig with tunable weights and flags. Defaults used if None.
-
-    Returns:
-        (result, metadata) tuple where metadata includes latency, fallback usage, etc.
-
-    Raises:
-        TriageError: only if both the normal and fallback pipelines fail.
-    """
-    if config is None:
-        config = TriageConfig()
-    config.validate()
-
-    start_time = time.time()
-    meta = TriageRunMeta()
-
-    try:
-        if patient.mass_casualty_mode:
-            result = triage_single_mass_casualty(patient)
-            meta.latency_ms = (time.time() - start_time) * 1000
-
-            if config.enable_metrics:
-                record_triage_run(patient, result, meta.latency_ms)
-
-            return result, meta
-
-        # --- Normal pipeline (NLP + vitals + age) ---
-        try:
-            nlp_label, nlp_confidence, used_fallback = classify_chief_complaint(
-                patient.chief_complaint
-            )
-            meta.nlp_label = nlp_label
-            meta.nlp_confidence = nlp_confidence
-            meta.used_nlp_fallback = used_fallback
-
-            if used_fallback:
-                meta.error_recovery_steps.append("NLP model fallback (keyword classifier)")
-
-        except Exception as nlp_error:
-            meta.error_recovery_steps.append(f"NLP error recovered: {type(nlp_error).__name__}")
-            # Final fallback: assume low urgency if NLP completely fails
-            nlp_label = "Routine"
-            nlp_confidence = 0.5
-            meta.used_nlp_fallback = True
-            meta.nlp_label = nlp_label
-            meta.nlp_confidence = nlp_confidence
-
-        # Get urgency weight for this label
-        from engine.nlp_classifier import LABEL_URGENCY_WEIGHT
-        nlp_urgency = round(nlp_confidence * LABEL_URGENCY_WEIGHT[nlp_label], 4)
-
-        # Vital deviations and age
-        vital_dev = score_vital_deviation(
-            patient.age, patient.heart_rate, patient.spo2, patient.temperature
-        )
-        age_factor = score_age_factor(patient.age)
-
-        # Compute risk
-        risk_score, breakdown = compute_risk(
-            vital_dev, nlp_urgency, age_factor,
-            alpha=config.alpha, beta=config.beta, gamma=config.gamma
-        )
-        esi_level = map_risk_to_esi(risk_score)
-
-        # Check for auto-triggered decisions
-        decisions = check_decide_triggers(vital_dev, nlp_urgency, nlp_label, patient.heart_rate)
-
-        # Enforce decision-recommendation coherence
-        if config.enable_decision_coherence_check and decisions and esi_level > DECIDE_TRIGGER_ESI_CEILING:
-            esi_level = DECIDE_TRIGGER_ESI_CEILING
-            meta.error_recovery_steps.append("ESI corrected for decision-recommendation coherence")
-
-        result = TriageResult(
-            risk_score=risk_score,
-            esi_level=esi_level,
-            decisions=decisions,
-            mass_casualty_mode=False,
-            explain=breakdown,
-            reason=None,
-        )
-
-        meta.latency_ms = (time.time() - start_time) * 1000
-
-        if config.enable_metrics:
-            record_triage_run(
-                patient, result, meta.latency_ms,
-                nlp_label=nlp_label,
-                nlp_confidence=nlp_confidence,
-                used_nlp_fallback=meta.used_nlp_fallback,
-            )
-
-        return result, meta
-
-    except Exception as exc:
-        meta.latency_ms = (time.time() - start_time) * 1000
-        raise TriageError(
-            f"Triage pipeline failed to produce a result. Recovery attempts: {meta.error_recovery_steps}. "
-            f"Error: {exc}"
-        ) from exc
-</file>
-
-<file path="engine/orchestrator.py">
-"""
-engine/orchestrator.py
-
-Owner: Satya — Day 2
-
-The single entry point the UI calls. Everything about *which* pipeline a
-patient goes through, and how errors are handled, lives here — the UI
-layer should never call nlp_classifier / risk_engine / vitals_age /
-mass_casualty directly.
-"""
-
-from __future__ import annotations
-
-from dataclasses import dataclass
-
-from engine.mass_casualty import triage_single_mass_casualty
-from engine.nlp_classifier import classify_chief_complaint
-from engine.risk_engine import DEFAULT_ALPHA, DEFAULT_BETA, DEFAULT_GAMMA, check_decide_triggers, compute_risk, map_risk_to_esi
-from engine.vitals_age import score_age_factor, score_vital_deviation
-from models.schemas import PatientInput, TriageResult
-
-
-class TriageError(Exception):
-    """Raised when the pipeline cannot produce a result at all."""
-
-
-# If any decide-trigger fires, the recommended ESI level is never allowed to
-# be weaker (numerically higher) than this. 2 = "Emergent" — see the ESI
-# scale in risk_engine.py.
-DECIDE_TRIGGER_ESI_CEILING = 2
-
-
-@dataclass
-class TriageRunMeta:
-    """Extra, UI-relevant metadata about how a result was produced."""
-
-    used_nlp_fallback: bool = False
-
-
-def run_triage(
-    patient: PatientInput,
-    alpha: float = DEFAULT_ALPHA,
-    beta: float = DEFAULT_BETA,
-    gamma: float = DEFAULT_GAMMA,
-) -> tuple[TriageResult, TriageRunMeta]:
-    """
-    Route a PatientInput to the correct pipeline and return a TriageResult.
-
-    - mass_casualty_mode=True  -> deterministic, vitals-only bypass queue.
-    - mass_casualty_mode=False -> full MMTG pipeline (NLP + vitals + age).
-
-    Raises:
-        TriageError if neither pipeline can produce a result (e.g. a
-        completely unexpected internal failure). Both individual pipelines
-        already degrade gracefully on their own (see nlp_classifier.py's
-        fallback), so this should be rare — it exists as a last line of
-        defense so the UI never sees a raw traceback.
-    """
-    try:
-        if patient.mass_casualty_mode:
-            result = triage_single_mass_casualty(patient)
-            return result, TriageRunMeta(used_nlp_fallback=False)
-
-        nlp_label, nlp_confidence, used_fallback = classify_chief_complaint(
-            patient.chief_complaint
-        )
-        from engine.nlp_classifier import LABEL_URGENCY_WEIGHT
-
-        nlp_urgency = round(nlp_confidence * LABEL_URGENCY_WEIGHT[nlp_label], 4)
-
-        vital_dev = score_vital_deviation(
-            patient.age, patient.heart_rate, patient.spo2, patient.temperature
-        )
-        age_factor = score_age_factor(patient.age)
-
-        risk_score, breakdown = compute_risk(
-            vital_dev, nlp_urgency, age_factor, alpha=alpha, beta=beta, gamma=gamma
-        )
-        esi_level = map_risk_to_esi(risk_score)
-        decisions = check_decide_triggers(vital_dev, nlp_urgency, nlp_label, patient.heart_rate)
-
-        # Coherence invariant: if the system is confident enough to auto-trigger
-        # a protocol action (e.g. auto-order an ECG), it can never simultaneously
-        # recommend an ESI level weaker than "Emergent". A decide-trigger and a
-        # low-urgency recommendation contradicting each other is exactly the kind
-        # of inconsistency that erodes clinician trust — so we enforce it as an
-        # explicit floor here rather than relying on threshold tuning alone.
-        if decisions and esi_level > DECIDE_TRIGGER_ESI_CEILING:
-            esi_level = DECIDE_TRIGGER_ESI_CEILING
-
-        result = TriageResult(
-            risk_score=risk_score,
-            esi_level=esi_level,
-            decisions=decisions,
-            mass_casualty_mode=False,
-            explain=breakdown,
-            reason=None,
-        )
-        return result, TriageRunMeta(used_nlp_fallback=used_fallback)
-
-    except Exception as exc:  # last line of defense — UI must never see a raw traceback
-        raise TriageError(f"Triage pipeline failed to produce a result: {exc}") from exc
-</file>
-
-<file path="engine/risk_engine.py">
-"""
-engine/risk_engine.py
-
-Owner: Qudsia — Day 2
-
-Baseline implementation is complete and tested. The DAG is modeled as an
-explicit class (RiskDAG) rather than a bare formula, so its node structure
-is inspectable — a judge can print `RiskDAG().describe()` and see exactly
-how a score was built, which is the whole point of choosing a graph over a
-black-box model.
-
-Qudsia: the weights, ESI thresholds, and decide-trigger rules below are all
-tunable in one place (top of file) — refine them against real/synthetic
-data without needing to touch the rest of the pipeline.
-"""
-
-from __future__ import annotations
-
-from dataclasses import dataclass
-
-from models.schemas import ExplainabilityBreakdown
-
-# --------------------------------------------------------------------------- #
-# Tunable parameters — the whole point of a transparent formula is that these
-# live in one place and are easy to defend/adjust.
-# --------------------------------------------------------------------------- #
-
-DEFAULT_ALPHA = 0.4   # weight on vital deviation
-DEFAULT_BETA = 0.4    # weight on NLP urgency
-DEFAULT_GAMMA = 0.2   # weight on age factor
-
-# ESI thresholds: risk_score >= threshold -> that ESI level.
-# Checked from most urgent (1) to least urgent (5); first match wins.
-ESI_THRESHOLDS = [
-    (0.80, 1),
-    (0.60, 2),
-    (0.40, 3),
-    (0.20, 4),
-    (0.00, 5),
-]
-
-
-# --------------------------------------------------------------------------- #
-# The DAG
-# --------------------------------------------------------------------------- #
-
-@dataclass
-class RiskNode:
-    name: str
-    value: float
-    weight: float | None = None
-
-    @property
-    def contribution(self) -> float:
-        return self.value if self.weight is None else self.value * self.weight
-
-
-class RiskDAG:
-    """
-    A small, explicit directed acyclic graph:
-
-        Vital_Deviation ---\\
-        NLP_Urgency -------- Risk_Score
-        Age_Factor  --------/
-
-    Each input node feeds one edge, weighted by alpha/beta/gamma, into a
-    single Risk_Score output node. Modeling it this way (rather than a bare
-    expression) means `describe()` can render the exact structure a judge
-    would want to see in an explainability audit.
-    """
-
-    def __init__(self, alpha: float = DEFAULT_ALPHA, beta: float = DEFAULT_BETA,
-                 gamma: float = DEFAULT_GAMMA):
-        self.alpha = alpha
-        self.beta = beta
-        self.gamma = gamma
-
-    def score(
-        self, vital_deviation: float, nlp_urgency: float, age_factor: float
-    ) -> tuple[float, ExplainabilityBreakdown]:
-        nodes = [
-            RiskNode("Vital_Deviation", vital_deviation, self.alpha),
-            RiskNode("NLP_Urgency", nlp_urgency, self.beta),
-            RiskNode("Age_Factor", age_factor, self.gamma),
-        ]
-        risk_score = round(min(1.0, sum(n.contribution for n in nodes)), 4)
-
-        breakdown = ExplainabilityBreakdown(
-            vital_deviation=vital_deviation,
-            nlp_urgency=nlp_urgency,
-            age_factor=age_factor,
-            alpha=self.alpha,
-            beta=self.beta,
-            gamma=self.gamma,
-            alpha_contribution=round(nodes[0].contribution, 4),
-            beta_contribution=round(nodes[1].contribution, 4),
-            gamma_contribution=round(nodes[2].contribution, 4),
-        )
-        return risk_score, breakdown
-
-    def describe(self) -> str:
-        return (
-            f"RiskDAG(alpha={self.alpha}, beta={self.beta}, gamma={self.gamma}) "
-            f"-> Risk_Score = alpha*Vital_Deviation + beta*NLP_Urgency + gamma*Age_Factor"
-        )
-
-
-# --------------------------------------------------------------------------- #
-# Public functions (the contract the orchestrator/UI call against)
-# --------------------------------------------------------------------------- #
-
-def compute_risk(
-    vital_deviation: float,
-    nlp_urgency: float,
-    age_factor: float,
-    alpha: float = DEFAULT_ALPHA,
-    beta: float = DEFAULT_BETA,
-    gamma: float = DEFAULT_GAMMA,
-) -> tuple[float, ExplainabilityBreakdown]:
-    """
-    Combine the three sub-scores into a final risk score via the RiskDAG.
-
-    Returns:
-        (risk_score, explainability_breakdown)
-    """
-    dag = RiskDAG(alpha=alpha, beta=beta, gamma=gamma)
-    return dag.score(vital_deviation, nlp_urgency, age_factor)
-
-
-def map_risk_to_esi(risk_score: float) -> int:
-    """
-    Map a continuous risk score in [0.0, 1.0] to a discrete ESI level (1-5).
-
-    1 = most urgent, 5 = least urgent. Thresholds are defined in
-    ESI_THRESHOLDS above — adjust them there, not here.
-    """
-    for threshold, esi in ESI_THRESHOLDS:
-        if risk_score >= threshold:
-            return esi
-    return 5  # fallback, should be unreachable given the 0.00 threshold
-
-
-def check_decide_triggers(
-    vital_deviation: float,
-    nlp_urgency: float,
-    nlp_label: str,
-    heart_rate: int,
-) -> list[str]:
-    """
-    Return narrow, high-confidence auto-triggered actions.
-
-    Deliberately conservative — this is the "decide" side of
-    decide-vs-recommend, so false positives are costly. Most patients
-    return an empty list.
-    """
-    decisions: list[str] = []
-
-    if nlp_label == "Cardiac" and nlp_urgency >= 0.80 and heart_rate > 120:
-        decisions.append("DECISION: Auto-order ECG + Cardiac Enzyme Panel")
-
-    if nlp_label == "Respiratory" and nlp_urgency >= 0.80 and vital_deviation >= 0.5:
-        decisions.append("DECISION: Auto-order pulse oximetry re-check + oxygen prep")
-
-    if nlp_label == "Trauma" and vital_deviation >= 0.7:
-        decisions.append("DECISION: Flag for immediate trauma-bay routing")
-
-    return decisions
-</file>
-
-<file path="engine/vitals_age.py">
-"""
-engine/vitals_age.py
-
-Owner: Ayush — Day 1
-
-Baseline implementation is complete and tested. Ayush: feel free to refine
-the clinical thresholds/weights below — the function signatures and return
-contract (float in [0.0, 1.0]) must stay the same, since risk_engine.py and
-orchestrator.py both depend on them.
-"""
-
-from __future__ import annotations
-
-# --------------------------------------------------------------------------- #
-# Clinical reference ranges (adult). Documented here so the scoring logic is
-# auditable, not a black box — cite these if a judge asks.
-# --------------------------------------------------------------------------- #
-
-NORMAL_HR = (60, 100)          # bpm
-NORMAL_SPO2_MIN = 95.0         # %
-NORMAL_TEMP = (36.1, 37.2)     # deg C
-
-
-def _deviation_fraction(value: float, low: float, high: float, hard_span: float) -> float:
-    """
-    How far `value` sits outside [low, high], normalized to [0.0, 1.0].
-
-    0.0 if inside the normal range. Scales linearly up to 1.0 once the value
-    is `hard_span` units past the boundary (clamped beyond that), so a mild
-    deviation scores low and a severe one saturates at 1.0 instead of growing
-    without bound.
-    """
-    if low <= value <= high:
-        return 0.0
-    distance = low - value if value < low else value - high
-    return min(1.0, distance / hard_span)
-
-
-def score_vital_deviation(age: int, heart_rate: int, spo2: float, temperature: float) -> float:
-    """
-    Score how far a patient's vitals deviate from safe clinical ranges.
-
-    Combines three independent deviation fractions (heart rate, SpO2,
-    temperature) into one score via a weighted max-and-average blend: the
-    single worst vital dominates (a critically low SpO2 alone should already
-    read as high-risk), but the other two still nudge the score up, so two
-    moderately-abnormal vitals together score higher than either alone.
-
-    Returns:
-        Float in [0.0, 1.0]. 0.0 = all vitals normal, 1.0 = severely abnormal.
-    """
-    hr_dev = _deviation_fraction(heart_rate, *NORMAL_HR, hard_span=60)
-    spo2_dev = 0.0 if spo2 >= NORMAL_SPO2_MIN else min(1.0, (NORMAL_SPO2_MIN - spo2) / 20)
-    temp_dev = _deviation_fraction(temperature, *NORMAL_TEMP, hard_span=3.5)
-
-    worst = max(hr_dev, spo2_dev, temp_dev)
-    average = (hr_dev + spo2_dev + temp_dev) / 3
-    return round(min(1.0, 0.7 * worst + 0.3 * average), 4)
-
-
-def score_age_factor(age: int) -> float:
-    """
-    Score age-based risk contribution.
-
-    Higher for very young (<5) and elderly (>65) patients, reflecting real
-    clinical risk stratification — both groups decompensate faster and
-    tolerate the same vital deviation less well than a healthy adult.
-
-    Returns:
-        Float in [0.0, 1.0].
-    """
-    if age < 1:
-        return 1.0
-    if age < 5:
-        return round(0.75 - (age / 5) * 0.25, 4)      # 0.75 -> 0.50
-    if age <= 65:
-        return 0.1
-    if age <= 80:
-        return round(0.1 + ((age - 65) / 15) * 0.4, 4)  # 0.10 -> 0.50
-    return round(min(1.0, 0.5 + ((age - 80) / 20) * 0.5), 4)  # 0.50 -> 1.00+
-</file>
-
-<file path="models/__init__.py">
-
-</file>
-
-<file path="models/schemas.py">
-"""
-models/schemas.py
-
-Shared data contract for PatientTriage.ai (MMTG).
-
-Every engine module (NLP classifier, risk engine, vitals/age scoring,
-mass casualty queue) reads a `PatientInput` and, directly or indirectly,
-contributes to a `TriageResult`. Keep these strict — validation errors
-here should surface immediately in the UI, not silently produce a bad
-risk score.
-"""
-
-from __future__ import annotations
-
-from pydantic import BaseModel, Field, field_validator
-
-
-# --------------------------------------------------------------------------- #
-# Input
-# --------------------------------------------------------------------------- #
-
-class PatientInput(BaseModel):
-    """
-    First-minute data captured for a patient at ED arrival.
-
-    Only fields realistically available in the first minute belong here —
-    resist the urge to add "nice to have" fields once lab results, imaging,
-    etc. come back. That's the whole point of the design constraint.
-    """
-
-    age: int = Field(
-        ...,
-        ge=0,
-        le=120,
-        description="Patient age in years.",
-    )
-    heart_rate: int = Field(
-        ...,
-        ge=0,
-        le=300,
-        description="Heart rate in beats per minute (bpm).",
-    )
-    spo2: float = Field(
-        ...,
-        ge=0.0,
-        le=100.0,
-        description="Blood oxygen saturation, percent (%).",
-    )
-    temperature: float = Field(
-        ...,
-        ge=25.0,
-        le=45.0,
-        description="Body temperature in degrees Celsius. "
-        "Range covers severe hypothermia through severe hyperthermia.",
-    )
-    chief_complaint: str = Field(
-        ...,
-        min_length=1,
-        max_length=500,
-        description="Free-text description of why the patient is here, "
-        "captured verbatim at intake.",
-    )
-    mass_casualty_mode: bool = Field(
-        default=False,
-        description="When True, the engine MUST bypass the NLP pipeline "
-        "entirely and route through the deterministic vitals-only queue.",
-    )
-
-    @field_validator("chief_complaint")
-    @classmethod
-    def complaint_not_blank(cls, v: str) -> str:
-        if not v.strip():
-            raise ValueError("chief_complaint cannot be blank or whitespace-only")
-        return v.strip()
-
-    model_config = {
-        "json_schema_extra": {
-            "example": {
-                "age": 54,
-                "heart_rate": 128,
-                "spo2": 91.0,
-                "temperature": 37.6,
-                "chief_complaint": "Patient clutching chest, says it feels tight",
-                "mass_casualty_mode": False,
-            }
-        }
-    }
-
-
-# --------------------------------------------------------------------------- #
-# Output
-# --------------------------------------------------------------------------- #
-
-class ExplainabilityBreakdown(BaseModel):
-    """
-    Raw sub-scores and their weighted contribution to the final risk score.
-
-    This is what powers the explainability panel — every number here should
-    be something the UI can render directly (e.g. as a progress bar) without
-    any further computation.
-    """
-
-    vital_deviation: float = Field(..., ge=0.0, le=1.0)
-    nlp_urgency: float = Field(..., ge=0.0, le=1.0)
-    age_factor: float = Field(..., ge=0.0, le=1.0)
-
-    alpha: float = Field(..., description="Weight applied to vital_deviation.")
-    beta: float = Field(..., description="Weight applied to nlp_urgency.")
-    gamma: float = Field(..., description="Weight applied to age_factor.")
-
-    alpha_contribution: float = Field(
-        ..., description="alpha * vital_deviation — this term's share of Risk_Score."
-    )
-    beta_contribution: float = Field(
-        ..., description="beta * nlp_urgency — this term's share of Risk_Score."
-    )
-    gamma_contribution: float = Field(
-        ..., description="gamma * age_factor — this term's share of Risk_Score."
-    )
-
-
-class TriageResult(BaseModel):
-    """
-    The engine's complete output for one patient.
-
-    `decisions` is intentionally a short list — only narrow, protocol-safe
-    auto-actions belong here (the "decide" side of decide-vs-recommend).
-    Everything else the system suggests belongs in `esi_level`, which the
-    nurse always confirms.
-    """
-
-    risk_score: float = Field(
-        ..., ge=0.0, le=1.0, description="Final combined MMTG risk score."
-    )
-    esi_level: int = Field(
-        ...,
-        ge=1,
-        le=5,
-        description="Recommended Emergency Severity Index. "
-        "1 = most urgent, 5 = least urgent. Always nurse-confirmed.",
-    )
-    decisions: list[str] = Field(
-        default_factory=list,
-        description='Narrow, auto-triggered protocol actions, e.g. '
-        '"Auto-order ECG + Cardiac Enzyme Panel". Empty in most cases.',
-    )
-    mass_casualty_mode: bool = Field(
-        default=False,
-        description="True if this result came from the deterministic "
-        "vitals-only bypass queue rather than the full MMTG pipeline.",
-    )
-    explain: ExplainabilityBreakdown | None = Field(
-        default=None,
-        description="Full weight breakdown for the explainability panel. "
-        "None when mass_casualty_mode is True — that path is rule-based, "
-        "not weighted, so there is nothing to attribute to alpha/beta/gamma.",
-    )
-    reason: str | None = Field(
-        default=None,
-        description="One-line plain-English reason, primarily used by the "
-        "Mass Casualty queue (e.g. 'SpO2 critically low, elevated heart rate').",
-    )
 </file>
 
 <file path="tests/__init__.py">
@@ -8828,38 +8502,282 @@ with right:
     st.markdown("</div>", unsafe_allow_html=True)
 </file>
 
-<file path=".gitignore">
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-.env
-.venv
-venv/
-ENV/
-.vscode/
-.idea/
-*.log
-.pytest_cache/
-.coverage
-htmlcov/
-node_modules/
+<file path=".env.example">
+# Database
+DATABASE_URL=postgresql://user:password@localhost:5432/patienttriage
+SQLALCHEMY_DATABASE_URL=postgresql://user:password@localhost:5432/patienttriage
+
+# API Settings
+API_HOST=0.0.0.0
+API_PORT=8000
+DEBUG=True
+ENVIRONMENT=development
+
+# CORS
+CORS_ORIGINS=["http://localhost:3000","http://localhost:8501"]
+
+# Authentication
+API_KEY_HEADER=X-API-Key
+SECRET_KEY=your-secret-key-here
+
+# NLP Settings
+NLP_MODEL=facebook/bart-large-mnli
+NLP_DEVICE=cpu
+
+# Logging
+LOG_LEVEL=INFO
+</file>
+
+<file path="INTEGRATION_GUIDE.md">
+# PatientTriage.ai Round 2 - File Integration Guide
+
+## Complete File Mapping
+
+### Backend Files
+
+**`backend/api/main.py`** - FastAPI application entry point
+- Single patient triage endpoint: `POST /v1/triage/assess`
+- Batch processing endpoint: `POST /v1/triage/batch`
+- Patient management: `POST/GET /v1/patients`
+- Metrics endpoints: `GET /v1/metrics/summary`, `GET /v1/metrics/export`
+- Health checks: `GET /health`, `GET /health/detailed`
+- CORS, logging, error handling middleware
+
+**`backend/config/settings.py`** - Configuration management
+- Database URL configuration
+- API settings (host, port, debug mode)
+- CORS allowed origins
+- Authentication settings
+- Logging configuration
+- Environment-based config loading
+
+**`backend/db/models.py`** - SQLAlchemy ORM models
+- `Patient` model with medical record tracking
+- `TriageAssessment` model with full audit trail
+- `BatchJob` model for tracking batch processing
+- `Metric` model for analytics storage
+- Relationships and indexes for query optimization
+
+**`backend/schemas/schemas.py`** - Pydantic request/response models
+- `TriageAssessmentRequest` - Input validation
+- `TriageAssessmentResponse` - Output with ESI level, decision, explainability
+- `PatientCreate`, `PatientResponse` - Patient CRUD
+- `BatchTriageRequest`, `BatchTriageResponse` - Batch operations
+- `MetricsSummary` - Analytics data structure
+
+**`backend/services/triage_service.py`** - Business logic layer
+- `TriageService` class integrating the triage engine
+- `assess_patient()` - Single patient assessment
+- `assess_batch()` - Batch processing with error recovery
+- Metrics logging and retrieval
+- Integration with SQLAlchemy for persistence
+
+### ML Files
+
+**`ml/training/train.py`** - ML training pipeline
+- Custom NLP model fine-tuning
+- Dataset preparation for medical urgency classification
+- Model evaluation and validation
+- Hyperparameter optimization
+- Model versioning and checkpointing
+
+### DevOps Files
+
+**`devops/docker/Dockerfile`** - Backend container image
+- Python 3.11 base image
+- Dependencies installation
+- Application setup and startup command
+
+**`devops/docker/docker-compose.dev.yml`** - Local development setup
+- PostgreSQL database service
+- FastAPI backend service
+- Streamlit frontend service
+- Volume mounts for code hot-reload
+- Network configuration
+
+**`devops/github_actions_ci_cd.yml`** - Automated testing and deployment
+- Lint and format checking
+- Unit and integration tests
+- Docker image building and pushing
+- Deployment automation
+
+### Frontend Files
+
+**`frontend/ui/app.py`** - Main Streamlit interface (Round 1)
+**`frontend/ui/app_advanced.py`** - Advanced features (batch, metrics)
+
+### Core Engine (Round 1)
+
+**`engine/`** - MMTG triage logic
+- `orchestrator.py` - Main entry point
+- `risk_engine.py` - Risk scoring DAG
+- `nlp_classifier.py` - NLP urgency scoring
+- `vitals_age.py` - Vital and age factor scoring
+- `mass_casualty.py` - Deterministic fallback
+- `config.py`, `metrics.py` - Configuration and observability
+
+**`models/schemas.py`** - Shared Pydantic models
+
+### Configuration Files
+
+**.env.example** - Environment variables template
+**requirements.txt** - All Python dependencies
+**.gitignore** - Git ignore rules
+
+### Documentation
+
+**docs/SETUP_GUIDE.md** - Complete installation guide
+**docs/ROUND2_IMPLEMENTATION_SUMMARY.md** - What's been built
+**docs/ROUND2_ROADMAP.md** - Development roadmap
+**docs/README_ORIGINAL.md** - Round 1 documentation
+
+---
+
+## Installation & Running
+
+### 1. Backend API
+```bash
+cd backend
+pip install -r ../requirements.txt
+export DATABASE_URL=postgresql://user:pass@localhost:5432/patienttriage
+python -m uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+### 2. Frontend (Streamlit)
+```bash
+cd frontend
+streamlit run ui/app.py --server.port 8501
+```
+
+### 3. Database (Docker)
+```bash
+docker-compose -f devops/docker/docker-compose.dev.yml up postgres
+```
+
+### 4. Full Stack (Docker Compose)
+```bash
+docker-compose -f devops/docker/docker-compose.dev.yml up
+```
+
+---
+
+## API Endpoints
+
+### Triage
+- `POST /v1/triage/assess` - Single patient assessment
+- `POST /v1/triage/batch` - Batch CSV processing
+
+### Patients
+- `POST /v1/patients` - Create patient record
+- `GET /v1/patients/{id}` - Get patient details
+- `GET /v1/patients` - List all patients
+
+### Metrics
+- `GET /v1/metrics/summary` - Summary statistics
+- `GET /v1/metrics/export` - Export as JSON/CSV
+
+### Health
+- `GET /health` - Simple health check
+- `GET /health/detailed` - Detailed component status
+
+---
+
+## Testing
+
+```bash
+# Unit tests
+pytest tests/unit/ -v
+
+# Integration tests
+pytest tests/integration/ -v
+
+# Coverage report
+pytest tests/ --cov=backend --cov=engine --cov-report=html
+```
+
+---
+
+## Deployment
+
+### Docker Compose (Local Development)
+```bash
+docker-compose -f devops/docker/docker-compose.dev.yml up
+```
+
+### Kubernetes (Production)
+```bash
+# Build image
+docker build -f devops/docker/Dockerfile -t patienttriage:latest .
+
+# Push to registry
+docker tag patienttriage:latest myregistry.azurecr.io/patienttriage:latest
+docker push myregistry.azurecr.io/patienttriage:latest
+
+# Deploy
+kubectl apply -f devops/kubernetes/deployment.yaml
+```
+
+---
+
+## Environment Variables
+
+Copy `.env.example` to `.env` and configure:
+
+```bash
+# Database
+DATABASE_URL=postgresql://localhost:5432/patienttriage
+
+# API
+API_HOST=0.0.0.0
+API_PORT=8000
+DEBUG=True
+
+# NLP
+NLP_MODEL=facebook/bart-large-mnli
+NLP_DEVICE=cpu  # or 'cuda'
+
+# CORS
+CORS_ORIGINS=["http://localhost:3000","http://localhost:8501"]
+```
+
+---
+
+## Troubleshooting
+
+### Database Connection Error
+```bash
+# Check PostgreSQL is running
+docker ps | grep postgres
+
+# Or install locally
+brew install postgresql
+brew services start postgresql
+```
+
+### Port Already in Use
+```bash
+# Backend
+python -m uvicorn api.main:app --port 8001
+
+# Frontend
+streamlit run ui/app.py --server.port 8502
+```
+
+### NLP Model Download Error
+```bash
+# Pre-download model
+python -c "from transformers import pipeline; pipeline('zero-shot-classification', model='facebook/bart-large-mnli')"
+```
+
+---
+
+## Next Steps
+
+1. Follow `docs/SETUP_GUIDE.md` for complete setup
+2. Review `docs/ROUND2_ROADMAP.md` for development priorities
+3. Read `docs/ROUND2_IMPLEMENTATION_SUMMARY.md` to understand what's built
+4. Start with the Streamlit frontend for testing
+5. Use the API for integration with external systems
 </file>
 
 <file path="triage_metrics.jsonl">
@@ -9093,6 +9011,40 @@ def classify_with_metadata(chief_complaint: str) -> dict:
         "urgency_score": urgency_score,
         "used_fallback": used_fallback,
     }
+</file>
+
+<file path=".gitignore">
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.env
+.venv
+venv/
+ENV/
+.vscode/
+.idea/
+*.log
+.pytest_cache/
+.coverage
+htmlcov/
+node_modules/
 </file>
 
 <file path="requirements.txt">

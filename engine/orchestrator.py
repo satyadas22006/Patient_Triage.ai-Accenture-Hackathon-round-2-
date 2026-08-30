@@ -1,92 +1,320 @@
 """
 engine/orchestrator.py
 
-Owner: Satya — Day 2
+Production-grade single entry point for PatientTriage.ai.
 
-The single entry point the UI calls. Everything about *which* pipeline a
-patient goes through, and how errors are handled, lives here — the UI
-layer should never call nlp_classifier / risk_engine / vitals_age /
-mass_casualty directly.
+Features:
+- Normal triage: NLP + vitals + age
+- Mass casualty mode: deterministic vitals-only routing
+- NLP fallback / graceful degradation
+- Explainable risk scoring
+- Decision-recommendation coherence
+- Latency tracking
+- Metrics collection
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 
 from engine.mass_casualty import triage_single_mass_casualty
+from engine.metrics import record_triage_run
 from engine.nlp_classifier import classify_chief_complaint
-from engine.risk_engine import DEFAULT_ALPHA, DEFAULT_BETA, DEFAULT_GAMMA, check_decide_triggers, compute_risk, map_risk_to_esi
+from engine.risk_engine import (
+    DEFAULT_ALPHA,
+    DEFAULT_BETA,
+    DEFAULT_GAMMA,
+    check_decide_triggers,
+    compute_risk,
+    map_risk_to_esi,
+)
 from engine.vitals_age import score_age_factor, score_vital_deviation
 from models.schemas import PatientInput, TriageResult
 
 
-class TriageError(Exception):
-    """Raised when the pipeline cannot produce a result at all."""
+# ---------------------------------------------------------------------------
+# Decision / recommendation coherence
+# ---------------------------------------------------------------------------
 
-
-# If any decide-trigger fires, the recommended ESI level is never allowed to
-# be weaker (numerically higher) than this. 2 = "Emergent" — see the ESI
-# scale in risk_engine.py.
+# If an automatic clinical decision trigger fires, the recommendation
+# cannot be weaker than ESI 2 (Emergent).
 DECIDE_TRIGGER_ESI_CEILING = 2
 
 
+# ---------------------------------------------------------------------------
+# NLP timeout configuration
+# ---------------------------------------------------------------------------
+
+NLP_TIMEOUT_SECONDS = 5.0
+
+
+# ---------------------------------------------------------------------------
+# Errors
+# ---------------------------------------------------------------------------
+
+class TriageError(Exception):
+    """Raised when the triage pipeline cannot produce a result."""
+    pass
+
+
+# ---------------------------------------------------------------------------
+# Run metadata
+# ---------------------------------------------------------------------------
+
 @dataclass
 class TriageRunMeta:
-    """Extra, UI-relevant metadata about how a result was produced."""
+    """
+    Metadata about how the triage result was produced.
+
+    This is consumed by the Streamlit UI for:
+    - NLP fallback status
+    - NLP label
+    - NLP confidence
+    - latency
+    - recovery information
+    """
 
     used_nlp_fallback: bool = False
+    nlp_confidence: float | None = None
+    nlp_label: str | None = None
+    latency_ms: float = 0.0
+    error_recovery_steps: list[str] = field(default_factory=list)
 
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+class TriageConfig:
+    """Tunable configuration for the triage engine."""
+
+    def __init__(
+        self,
+        alpha: float = DEFAULT_ALPHA,
+        beta: float = DEFAULT_BETA,
+        gamma: float = DEFAULT_GAMMA,
+        enable_metrics: bool = True,
+        enable_decision_coherence_check: bool = True,
+    ):
+        self.alpha = alpha
+        self.beta = beta
+        self.gamma = gamma
+        self.enable_metrics = enable_metrics
+        self.enable_decision_coherence_check = (
+            enable_decision_coherence_check
+        )
+
+    def validate(self) -> None:
+        """Validate configuration values."""
+
+        if not (0.0 <= self.alpha <= 1.0):
+            raise ValueError(
+                f"alpha must be in [0.0, 1.0], got {self.alpha}"
+            )
+
+        if not (0.0 <= self.beta <= 1.0):
+            raise ValueError(
+                f"beta must be in [0.0, 1.0], got {self.beta}"
+            )
+
+        if not (0.0 <= self.gamma <= 1.0):
+            raise ValueError(
+                f"gamma must be in [0.0, 1.0], got {self.gamma}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Main triage pipeline
+# ---------------------------------------------------------------------------
 
 def run_triage(
     patient: PatientInput,
-    alpha: float = DEFAULT_ALPHA,
-    beta: float = DEFAULT_BETA,
-    gamma: float = DEFAULT_GAMMA,
+    config: TriageConfig | None = None,
 ) -> tuple[TriageResult, TriageRunMeta]:
     """
-    Route a PatientInput to the correct pipeline and return a TriageResult.
+    Run the appropriate triage pipeline.
 
-    - mass_casualty_mode=True  -> deterministic, vitals-only bypass queue.
-    - mass_casualty_mode=False -> full MMTG pipeline (NLP + vitals + age).
+    Normal mode:
+        NLP + vitals + age + explainable risk scoring.
+
+    Mass casualty mode:
+        Deterministic vitals-only routing with NLP bypassed.
+
+    Returns:
+        (TriageResult, TriageRunMeta)
 
     Raises:
-        TriageError if neither pipeline can produce a result (e.g. a
-        completely unexpected internal failure). Both individual pipelines
-        already degrade gracefully on their own (see nlp_classifier.py's
-        fallback), so this should be rare — it exists as a last line of
-        defense so the UI never sees a raw traceback.
+        TriageError:
+            If the complete triage pipeline fails.
     """
-    try:
-        if patient.mass_casualty_mode:
-            result = triage_single_mass_casualty(patient)
-            return result, TriageRunMeta(used_nlp_fallback=False)
 
-        nlp_label, nlp_confidence, used_fallback = classify_chief_complaint(
-            patient.chief_complaint
-        )
+    # Use defaults when no custom configuration is supplied.
+    if config is None:
+        config = TriageConfig()
+
+    config.validate()
+
+    # Start latency measurement BEFORE any pipeline work.
+    start_time = time.time()
+
+    # Metadata object returned to the UI.
+    meta = TriageRunMeta()
+
+    try:
+
+        # ================================================================
+        # MASS CASUALTY MODE
+        # ================================================================
+
+        if patient.mass_casualty_mode:
+
+            # Mass casualty mode deliberately bypasses NLP.
+            result = triage_single_mass_casualty(patient)
+
+            # Record execution latency.
+            meta.latency_ms = (
+                time.time() - start_time
+            ) * 1000
+
+            # Record metrics if enabled.
+            if config.enable_metrics:
+                record_triage_run(
+                    patient,
+                    result,
+                    meta.latency_ms,
+                )
+
+            return result, meta
+
+        # ================================================================
+        # NORMAL TRIAGE PIPELINE
+        # ================================================================
+
+        # ---------------------------------------------------------------
+        # 1. NLP classification
+        # ---------------------------------------------------------------
+
+        try:
+
+            (
+                nlp_label,
+                nlp_confidence,
+                used_fallback,
+            ) = classify_chief_complaint(
+                patient.chief_complaint
+            )
+
+            meta.nlp_label = nlp_label
+            meta.nlp_confidence = nlp_confidence
+            meta.used_nlp_fallback = used_fallback
+
+            if used_fallback:
+                meta.error_recovery_steps.append(
+                    "NLP model fallback (keyword classifier)"
+                )
+
+        except Exception as nlp_error:
+
+            # If the NLP model completely fails, do not crash the
+            # entire triage pipeline.
+            meta.error_recovery_steps.append(
+                f"NLP error recovered: "
+                f"{type(nlp_error).__name__}"
+            )
+
+            nlp_label = "Routine"
+            nlp_confidence = 0.5
+
+            meta.used_nlp_fallback = True
+            meta.nlp_label = nlp_label
+            meta.nlp_confidence = nlp_confidence
+
+        # ---------------------------------------------------------------
+        # 2. Convert NLP result to urgency score
+        # ---------------------------------------------------------------
+
         from engine.nlp_classifier import LABEL_URGENCY_WEIGHT
 
-        nlp_urgency = round(nlp_confidence * LABEL_URGENCY_WEIGHT[nlp_label], 4)
+        nlp_urgency = round(
+            nlp_confidence
+            * LABEL_URGENCY_WEIGHT[nlp_label],
+            4,
+        )
+
+        # ---------------------------------------------------------------
+        # 3. Vital deviation
+        # ---------------------------------------------------------------
 
         vital_dev = score_vital_deviation(
-            patient.age, patient.heart_rate, patient.spo2, patient.temperature
+            patient.age,
+            patient.heart_rate,
+            patient.spo2,
+            patient.temperature,
         )
-        age_factor = score_age_factor(patient.age)
+
+        # ---------------------------------------------------------------
+        # 4. Age factor
+        # ---------------------------------------------------------------
+
+        age_factor = score_age_factor(
+            patient.age
+        )
+
+        # ---------------------------------------------------------------
+        # 5. Explainable risk calculation
+        # ---------------------------------------------------------------
 
         risk_score, breakdown = compute_risk(
-            vital_dev, nlp_urgency, age_factor, alpha=alpha, beta=beta, gamma=gamma
+            vital_dev,
+            nlp_urgency,
+            age_factor,
+            alpha=config.alpha,
+            beta=config.beta,
+            gamma=config.gamma,
         )
-        esi_level = map_risk_to_esi(risk_score)
-        decisions = check_decide_triggers(vital_dev, nlp_urgency, nlp_label, patient.heart_rate)
 
-        # Coherence invariant: if the system is confident enough to auto-trigger
-        # a protocol action (e.g. auto-order an ECG), it can never simultaneously
-        # recommend an ESI level weaker than "Emergent". A decide-trigger and a
-        # low-urgency recommendation contradicting each other is exactly the kind
-        # of inconsistency that erodes clinician trust — so we enforce it as an
-        # explicit floor here rather than relying on threshold tuning alone.
-        if decisions and esi_level > DECIDE_TRIGGER_ESI_CEILING:
+        # ---------------------------------------------------------------
+        # 6. Map risk score to ESI
+        # ---------------------------------------------------------------
+
+        esi_level = map_risk_to_esi(
+            risk_score
+        )
+
+        # ---------------------------------------------------------------
+        # 7. Automatic decision triggers
+        # ---------------------------------------------------------------
+
+        decisions = check_decide_triggers(
+            vital_dev,
+            nlp_urgency,
+            nlp_label,
+            patient.heart_rate,
+        )
+
+        # ---------------------------------------------------------------
+        # 8. Decision / recommendation coherence
+        # ---------------------------------------------------------------
+
+        if (
+            config.enable_decision_coherence_check
+            and decisions
+            and esi_level > DECIDE_TRIGGER_ESI_CEILING
+        ):
+
+            # If a critical automatic action is triggered,
+            # prevent a weaker ESI recommendation.
             esi_level = DECIDE_TRIGGER_ESI_CEILING
+
+            meta.error_recovery_steps.append(
+                "ESI corrected for "
+                "decision-recommendation coherence"
+            )
+
+        # ---------------------------------------------------------------
+        # 9. Build final result
+        # ---------------------------------------------------------------
 
         result = TriageResult(
             risk_score=risk_score,
@@ -96,7 +324,46 @@ def run_triage(
             explain=breakdown,
             reason=None,
         )
-        return result, TriageRunMeta(used_nlp_fallback=used_fallback)
 
-    except Exception as exc:  # last line of defense — UI must never see a raw traceback
-        raise TriageError(f"Triage pipeline failed to produce a result: {exc}") from exc
+        # ---------------------------------------------------------------
+        # 10. Record latency
+        # ---------------------------------------------------------------
+
+        meta.latency_ms = (
+            time.time() - start_time
+        ) * 1000
+
+        # ---------------------------------------------------------------
+        # 11. Record metrics
+        # ---------------------------------------------------------------
+
+        if config.enable_metrics:
+
+            record_triage_run(
+                patient,
+                result,
+                meta.latency_ms,
+                nlp_label=nlp_label,
+                nlp_confidence=nlp_confidence,
+                used_nlp_fallback=meta.used_nlp_fallback,
+            )
+
+        return result, meta
+
+    # ====================================================================
+    # FINAL ERROR HANDLER
+    # ====================================================================
+
+    except Exception as exc:
+
+        # Even failed runs have a latency value.
+        meta.latency_ms = (
+            time.time() - start_time
+        ) * 1000
+
+        raise TriageError(
+            "Triage pipeline failed to produce a result. "
+            f"Recovery attempts: "
+            f"{meta.error_recovery_steps}. "
+            f"Error: {exc}"
+        ) from exc
