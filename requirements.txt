@@ -1,19 +1,115 @@
-# Core dependencies
-streamlit==1.38.0
-pydantic==2.9.2
-transformers==4.44.2
-torch==2.4.1
-networkx==3.3
-pytest==8.3.3
+# ============================================================================
+# PatientTriage.ai Round 2 - Complete Requirements
+# Backend API, Database, ML Training, and UI
+# ============================================================================
 
-# Metrics, logging, and observability
-python-json-logger==2.0.7
+# ============================================================================
+# CORE DEPENDENCIES (Existing Round 1)
+# ============================================================================
+torch>=2.0.0,<3.0.0
+transformers>=4.30.0,<5.0.0
+numpy>=1.24.0,<2.0.0
+pandas>=1.5.0,<2.0.0
+pydantic>=2.0.0,<3.0.0
+streamlit>=1.20.0,<2.0.0
+plotly>=5.10.0,<6.0.0
 
-# Data processing (for batch mode)
-pandas==2.2.1
+# ============================================================================
+# BACKEND API (NEW - Phase 2)
+# ============================================================================
+# FastAPI & Web Server
+fastapi>=0.95.0,<1.0.0
+uvicorn[standard]>=0.21.0,<1.0.0
+python-multipart>=0.0.5,<1.0.0
+python-dotenv>=0.21.0,<1.0.0
+pydantic-settings>=2.0.0,<3.0.0
 
-# Development/testing extras
-pytest-cov==4.1.0
-pytest-xdist==3.5.0  # parallel test execution
-black==23.12.1       # code formatting
-mypy==1.7.1          # type checking
+# Database
+sqlalchemy>=2.0.0,<3.0.0
+psycopg2-binary>=2.9.0,<3.0.0  # PostgreSQL driver
+alembic>=1.10.0,<2.0.0  # Database migrations
+python-jose[cryptography]>=3.3.0,<4.0.0  # JWT/Security
+
+# ============================================================================
+# ML TRAINING (NEW - Phase 1)
+# ============================================================================
+# Model Fine-tuning
+peft>=0.4.0,<1.0.0  # LoRA for efficient training
+datasets>=2.10.0,<3.0.0
+accelerate>=0.20.0,<1.0.0  # Distributed training
+bitsandbytes>=0.39.0,<1.0.0  # Quantization
+
+# Experiment Tracking & Monitoring
+mlflow>=2.0.0,<3.0.0
+wandb>=0.13.0,<1.0.0  # Weights & Biases (optional)
+tensorboard>=2.10.0,<3.0.0
+
+# Hyperparameter Optimization
+optuna>=3.0.0,<4.0.0
+scikit-optimize>=0.9.0,<1.0.0
+
+# ============================================================================
+# ML EVALUATION & ANALYSIS
+# ============================================================================
+scikit-learn>=1.2.0,<2.0.0
+scipy>=1.10.0,<2.0.0
+matplotlib>=3.5.0,<4.0.0
+seaborn>=0.12.0,<1.0.0
+
+# ============================================================================
+# MONITORING & LOGGING
+# ============================================================================
+python-logging-loki>=0.3.2,<1.0.0  # Loki integration (optional)
+prometheus-client>=0.16.0,<1.0.0
+structlog>=23.1.0,<24.0.0
+
+# ============================================================================
+# TESTING & QUALITY
+# ============================================================================
+pytest>=7.3.0,<8.0.0
+pytest-asyncio>=0.20.0,<1.0.0
+pytest-cov>=4.1.0,<5.0.0
+pytest-benchmark>=4.0.0,<5.0.0
+httpx>=0.24.0,<1.0.0  # Async HTTP testing
+
+# Code Quality
+black>=23.3.0,<24.0.0
+isort>=5.12.0,<6.0.0
+flake8>=6.0.0,<7.0.0
+mypy>=1.2.0,<2.0.0
+
+# ============================================================================
+# DEPLOYMENT & DEVOPS
+# ============================================================================
+docker>=6.0.0,<7.0.0  # Docker SDK (optional)
+kubernetes>=26.0.0,<27.0.0  # K8s client (optional)
+
+# ============================================================================
+# UTILITIES
+# ============================================================================
+python-dateutil>=2.8.2,<3.0.0
+pytz>=2023.3,<2024.0.0
+requests>=2.31.0,<3.0.0
+httpx>=0.24.0,<1.0.0
+aiofiles>=23.1.0,<24.0.0  # Async file operations
+tqdm>=4.65.0,<5.0.0  # Progress bars
+
+# ============================================================================
+# OPTIONAL DEPENDENCIES
+# ============================================================================
+# For GPU training
+# pytorch-cuda>=11.8  # Only if using CUDA
+
+# For Apple Silicon
+# torch-macos  # Only if using M1/M2/M3
+
+# For distributed training
+# ray>=2.0.0,<3.0.0
+# horovod>=0.28.0,<1.0.0  # GPU-accelerated distributed training
+
+# ============================================================================
+# DEVELOPMENT DEPENDENCIES
+# ============================================================================
+ipython>=8.12.0,<9.0.0
+jupyter>=1.0.0,<2.0.0
+jupyterlab>=4.0.0,<5.0.0

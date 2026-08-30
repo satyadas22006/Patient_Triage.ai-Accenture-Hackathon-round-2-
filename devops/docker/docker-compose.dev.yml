@@ -1,0 +1,179 @@
+version: "3.9"
+
+services:
+  # ========================================================================
+  # PostgreSQL Database
+  # ========================================================================
+  postgres:
+    image: postgres:15-alpine
+    container_name: patienttriage_postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: patienttriage_ai
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/init-db.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - patienttriage_network
+
+  # ========================================================================
+  # Redis Cache (Optional - for caching)
+  # ========================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: patienttriage_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - patienttriage_network
+
+  # ========================================================================
+  # MLflow Tracking Server
+  # ========================================================================
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:latest
+    container_name: patienttriage_mlflow
+    ports:
+      - "5000:5000"
+    volumes:
+      - mlflow_data:/mlflow
+    command: mlflow server --host 0.0.0.0 --backend-store-uri file:/mlflow/backend --default-artifact-root /mlflow/artifacts
+    networks:
+      - patienttriage_network
+
+  # ========================================================================
+  # FastAPI Backend
+  # ========================================================================
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: patienttriage_api
+    environment:
+      ENVIRONMENT: development
+      DEBUG: "true"
+      API_HOST: 0.0.0.0
+      API_PORT: 8000
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_NAME: patienttriage_ai
+      REDIS_URL: redis://redis:6379
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      NLP_DEVICE: cpu  # Use CPU for development
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app/backend
+      - ./engine:/app/engine
+      - ./models:/app/models
+      - ./logs:/app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - patienttriage_network
+    command: >
+      sh -c "
+        alembic upgrade head &&
+        uvicorn backend.api.main:app --host 0.0.0.0 --port 8000 --reload
+      "
+
+  # ========================================================================
+  # Streamlit UI (Optional - for development)
+  # ========================================================================
+  ui:
+    image: python:3.11-slim
+    container_name: patienttriage_ui
+    working_dir: /app
+    environment:
+      STREAMLIT_SERVER_PORT: 8501
+      STREAMLIT_SERVER_ADDRESS: 0.0.0.0
+      API_URL: http://api:8000
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./ui:/app/ui
+      - ./engine:/app/engine
+      - ./requirements_round2.txt:/app/requirements_round2.txt
+    depends_on:
+      - api
+    networks:
+      - patienttriage_network
+    command: >
+      sh -c "
+        pip install -q -r requirements_round2.txt &&
+        streamlit run ui/app.py
+      "
+
+  # ========================================================================
+  # Prometheus (Metrics Collection - Optional)
+  # ========================================================================
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: patienttriage_prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+    networks:
+      - patienttriage_network
+
+  # ========================================================================
+  # Grafana (Metrics Dashboard - Optional)
+  # ========================================================================
+  grafana:
+    image: grafana/grafana:latest
+    container_name: patienttriage_grafana
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./docker/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./docker/grafana/datasources:/etc/grafana/provisioning/datasources
+    depends_on:
+      - prometheus
+    networks:
+      - patienttriage_network
+
+# ============================================================================
+# NETWORKS
+# ============================================================================
+networks:
+  patienttriage_network:
+    driver: bridge
+
+# ============================================================================
+# VOLUMES
+# ============================================================================
+volumes:
+  postgres_data:
+  redis_data:
+  mlflow_data:
+  prometheus_data:
+  grafana_data:
